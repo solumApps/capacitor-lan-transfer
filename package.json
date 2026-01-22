@@ -1,0 +1,41 @@
+{
+  "name": "capacitor-lan-transfer",
+  "version": "0.1.0",
+  "description": "Capacitor plugin for large LAN TCP transfer (server/client) with progress, optional AES-GCM, and SHA-256 integrity.",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "files": [
+    "android",
+    "ios",
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "tcp",
+    "lan",
+    "local-network",
+    "file-transfer",
+    "aes-gcm"
+  ],
+  "author": "You",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "YOUR_REPO_URL"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}

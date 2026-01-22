@@ -1,0 +1,29 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+  namespace "com.solum.lantransfer"
+  compileSdkVersion 34
+
+  defaultConfig {
+    minSdkVersion 21
+    targetSdkVersion 34
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  kotlinOptions {
+    jvmTarget = "17"
+  }
+}
+
+dependencies {
+  // Provided by the host Capacitor app
+  compileOnly project(':capacitor-android')
+  compileOnly project(':capacitor-cordova-android-plugins')
+
+  implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"
+}

@@ -1,0 +1,43 @@
+# Node / TS build
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Android
+android/.gradle/
+android/build/
+android/captures/
+android/local.properties
+android/**/.cxx/
+android/**/release/
+android/**/debug/
+*.iml
+
+# iOS / Xcode
+ios/Pods/
+ios/DerivedData/
+ios/build/
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# CocoaPods / Ruby
+*.gem
+.bundle/
+vendor/bundle/
+
+# OS
+.DS_Store
