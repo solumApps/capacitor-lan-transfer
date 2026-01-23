@@ -12,6 +12,14 @@
     "README.md",
     "package.json"
   ],
+  "capacitor": {
+    "android": {
+      "src": "android"
+    },
+    "ios": {
+      "src": "ios"
+    }
+  },
   "keywords": [
     "capacitor",
     "plugin",

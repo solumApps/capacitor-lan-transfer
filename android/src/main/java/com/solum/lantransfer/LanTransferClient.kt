@@ -1,5 +1,5 @@
 package com.solum.lantransfer
-
+import com.getcapacitor.JSObject
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -15,7 +15,7 @@ import javax.crypto.SecretKey
 
 class LanTransferClient(
   private val context: Context,
-  private val plugin: Plugin
+  private val plugin: LanTransferPlugin
 ) {
   private val executor = Executors.newSingleThreadExecutor()
   private var socket: Socket? = null
@@ -27,33 +27,50 @@ class LanTransferClient(
   fun isConnected(): Boolean = connected.get()
 
   fun connect(host: String, port: Int, sessionKey: String?, timeoutMs: Int = 7000) {
-    disconnect()
-    val s = Socket()
-    s.tcpNoDelay = true
-    s.connect(InetSocketAddress(host, port), timeoutMs)
-    socket = s
-    connected.set(true)
+    executor.execute {
+      try {
+        disconnect()
 
-    plugin.notifyListeners("status", mapOf(
-      "role" to "client",
-      "status" to "client_connected",
-      "remoteHost" to host,
-      "remotePort" to port
-    ))
+        val s = Socket()
+        s.tcpNoDelay = true
+        s.connect(InetSocketAddress(host, port), timeoutMs)
 
-    val out = BufferedOutputStream(s.getOutputStream())
-    LanTransferProtocol.writeHello(out, sessionKey)
-    out.flush()
+        socket = s
+        connected.set(true)
+
+        plugin.emit("status", JSObject().apply {
+          put("role", "client")
+          put("status", "client_connected")
+          put("remoteHost", host)
+          put("remotePort", port)
+        })
+
+        val out = BufferedOutputStream(s.getOutputStream())
+        LanTransferProtocol.writeHello(out, sessionKey)
+        out.flush()
+
+      } catch (e: Exception) {
+        connected.set(false)
+        socket = null
+
+        plugin.emit("error", JSObject().apply {
+          put("role", "client")
+          put("code", "CONNECT_FAILED")
+          put("message", e.message ?: e.toString())
+        })
+      }
+    }
   }
+
 
   fun disconnect() {
     connected.set(false)
     try { socket?.close() } catch (_: Exception) {}
     socket = null
-    plugin.notifyListeners("status", mapOf(
-      "role" to "client",
-      "status" to "client_disconnected"
-    ))
+    plugin.emit("status", JSObject().apply {
+      put("role", "client")
+      put("status", "client_disconnected")
+    })
   }
 
   fun sendString(text: String) {
@@ -84,13 +101,13 @@ class LanTransferClient(
           val iters = cfg?.iterations ?: 100_000
           val encodingStr = if (encoding == LanTransferProtocol.ENCODING_UTF8) "utf8" else "binary"
 
-          plugin.notifyListeners("status", mapOf(
-            "role" to "client",
-            "status" to "send_started",
-            "totalBytes" to totalPlain,
-            "encoding" to encodingStr,
-            "encrypted" to encrypted
-          ))
+          plugin.emit("status", JSObject().apply {
+            put("role", "client")
+            put("status", "send_started")
+            put("totalBytes", totalPlain)
+            put("encoding", encodingStr)
+            put("encrypted", encrypted)
+          })
 
           val headerMat = LanTransferCrypto.randomHeaderMaterial()
           LanTransferProtocol.writeDataHeaderV2(
@@ -153,11 +170,11 @@ class LanTransferClient(
           out.flush()
           emitSendComplete(totalPlain, encodingStr, true, HashUtils.toHex(digest.digest()))
         } catch (e: Exception) {
-          plugin.notifyListeners("error", mapOf(
-            "role" to "client",
-            "message" to ("Send failed: " + (e.message ?: e.toString())),
-            "code" to "SEND_FAILED"
-          ))
+          plugin.emit("error", JSObject().apply {
+            put("role", "client")
+            put("code", "SEND_FAILED")
+            put("message", e.message ?: e.toString())
+          })
         }
       }
     }
@@ -165,25 +182,31 @@ class LanTransferClient(
 
   private fun emitProgress(bytes: Long, total: Long) {
     val percent = if (total == 0L) 100.0 else (bytes * 100.0 / total)
-    plugin.notifyListeners("progress", mapOf(
-      "role" to "client",
-      "direction" to "send",
-      "bytesTransferred" to bytes,
-      "totalBytes" to total,
-      "percent" to percent
-    ))
+    plugin.emit("progress", JSObject().apply {
+      put("role", "client")
+      put("direction", "send")
+      put("bytesTransferred", bytes)
+      put("totalBytes", total)
+      put("percent", percent)
+    })
   }
 
-  private fun emitSendComplete(totalPlain: Long, encodingStr: String, encrypted: Boolean, sha256: String) {
-    plugin.notifyListeners("status", mapOf(
-      "role" to "client",
-      "status" to "send_complete",
-      "totalBytes" to totalPlain,
-      "encoding" to encodingStr,
-      "encrypted" to encrypted,
-      "sha256" to sha256
-    ))
+  private fun emitSendComplete(
+    totalPlain: Long,
+    encodingStr: String,
+    encrypted: Boolean,
+    sha256: String
+  ) {
+    plugin.emit("status", JSObject().apply {
+      put("role", "client")
+      put("status", "send_complete")
+      put("totalBytes", totalPlain)
+      put("encoding", encodingStr)
+      put("encrypted", encrypted)
+      put("sha256", sha256)
+    })
   }
+
 
   private fun openStreamAndSize(pathOrUri: String): Pair<InputStream, Long> {
     // file://... (Capacitor Filesystem)

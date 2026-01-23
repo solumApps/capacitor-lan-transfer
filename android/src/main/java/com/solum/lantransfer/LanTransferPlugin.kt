@@ -9,6 +9,12 @@ class LanTransferPlugin : Plugin() {
   private var server: LanTransferServer? = null
   private var client: LanTransferClient? = null
 
+
+  fun emit(event:String, data:JSObject){
+    notifyListeners(event,data)
+  }
+
+
   private fun parseCrypto(call: PluginCall): LanTransferCrypto.CryptoConfig? {
     val enc = call.getObject("encryption") ?: return null
     val enabled = enc.getBoolean("enabled") ?: false
@@ -172,7 +178,11 @@ class LanTransferPlugin : Plugin() {
   }
 
   private fun ensureServer() {
-    if (server == null) server = LanTransferServer(context, this)
+    if (server == null) {
+      server = LanTransferServer(context) { event, data ->
+        notifyListeners(event, data)
+      }
+    }
   }
 
   private fun ensureClient() {

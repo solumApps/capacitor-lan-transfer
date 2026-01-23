@@ -1,5 +1,5 @@
 package com.solum.lantransfer
-
+import com.getcapacitor.JSObject
 import android.content.Context
 import android.util.Base64
 import com.getcapacitor.Plugin
@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class LanTransferServer(
   private val context: Context,
-  private val plugin: Plugin,
+  private val emitEvent: (event: String, data:JSObject) -> Unit
 ) {
   private val executor = Executors.newCachedThreadPool()
   private var serverSocket: ServerSocket? = null
@@ -40,33 +40,33 @@ class LanTransferServer(
         val ss = ServerSocket(port)
         serverSocket = ss
 
-        plugin.notifyListeners("status", mapOf(
-          "role" to "server",
-          "status" to "server_started",
-          "ip" to NetUtils.getLocalIpv4Address(),
-          "port" to ss.localPort
-        ))
+        emitStatus(
+                    mapOf(
+                        "role" to "server",
+                        "status" to "server_started",
+                        "ip" to NetUtils.getLocalIpv4Address(),
+                        "port" to ss.localPort
+                    )
+                )
 
         while (running.get()) {
           val socket = ss.accept()
           activeSocket?.closeQuietly()
           activeSocket = socket
 
-          plugin.notifyListeners("status", mapOf(
-            "role" to "server",
-            "status" to "connection_accepted",
-            "remoteHost" to socket.inetAddress.hostAddress,
-            "remotePort" to socket.port
-          ))
+          emitStatus(
+                        mapOf(
+                            "role" to "server",
+                            "status" to "connection_accepted",
+                            "remoteHost" to socket.inetAddress.hostAddress,
+                            "remotePort" to socket.port
+                        )
+                    )
 
           executor.execute { handleConnection(socket) }
         }
       } catch (e: Exception) {
-        plugin.notifyListeners("error", mapOf(
-          "role" to "server",
-          "message" to ("Server error: " + (e.message ?: e.toString())),
-          "code" to "SERVER_ERROR"
-        ))
+        emitError("SERVER_ERROR", "Server error: ${e.message ?: e}")
       } finally {
         stop()
       }
@@ -80,10 +80,10 @@ class LanTransferServer(
     serverSocket?.closeQuietly()
     serverSocket = null
 
-    plugin.notifyListeners("status", mapOf(
-      "role" to "server",
-      "status" to "server_stopped"
-    ))
+    emitStatus(mapOf(
+            "role" to "server",
+            "status" to "server_stopped"
+        ))
   }
 
   private fun handleConnection(socket: Socket) {
@@ -95,11 +95,7 @@ class LanTransferServer(
       val clientKey = LanTransferProtocol.readHello(input)
       val expected = sessionKey
       if (!expected.isNullOrEmpty() && clientKey != expected) {
-        plugin.notifyListeners("error", mapOf(
-          "role" to "server",
-          "message" to "Session key mismatch; closing connection.",
-          "code" to "BAD_SESSION_KEY"
-        ))
+        emitError("BAD_SESSION_KEY", "Session key mismatch; closing connection.")
         socket.closeQuietly()
         return
       }
@@ -110,21 +106,19 @@ class LanTransferServer(
       val encoding = header.encoding
       val encodingStr = if (encoding == LanTransferProtocol.ENCODING_UTF8) "utf8" else "binary"
 
-      plugin.notifyListeners("status", mapOf(
-        "role" to "server",
-        "status" to "receive_started",
-        "totalBytes" to totalPlain,
-        "encoding" to encodingStr,
-        "encrypted" to header.encrypted
-      ))
+      emitStatus(
+                mapOf(
+                    "role" to "server",
+                    "status" to "receive_started",
+                    "totalBytes" to totalPlain,
+                    "encoding" to encodingStr,
+                    "encrypted" to header.encrypted
+                )
+            )
 
       val cfg = crypto
       if (cfg?.requireEncryption == true && !header.encrypted) {
-        plugin.notifyListeners("error", mapOf(
-          "role" to "server",
-          "message" to "Server requires encryption but received unencrypted payload.",
-          "code" to "ENCRYPTION_REQUIRED"
-        ))
+        emitError("ENCRYPTION_REQUIRED", "Server requires encryption but received unencrypted payload.")
         socket.closeQuietly()
         return
       }
@@ -137,11 +131,7 @@ class LanTransferServer(
           copyPlainWithProgressAndHash(input, out, totalPlain, digest)
         } else {
           val pass = cfg?.passphrase ?: run {
-            plugin.notifyListeners("error", mapOf(
-              "role" to "server",
-              "message" to "Encrypted payload received but server passphrase not set.",
-              "code" to "NO_PASSPHRASE"
-            ))
+            emitError("NO_PASSPHRASE", "Encrypted payload received but server passphrase not set.")
             return
           }
           val key = LanTransferCrypto.deriveKey(pass, header.salt16, cfg.iterations)
@@ -180,53 +170,43 @@ class LanTransferServer(
 
       // receiveComplete includes sha256
       if (receiveMode == "file") {
-        plugin.notifyListeners("receiveComplete", mapOf(
-          "role" to "server",
-          "encoding" to encodingStr,
-          "totalBytes" to totalPlain,
-          "filePath" to (outFile?.absolutePath ?: ""),
-          "sha256" to sha
-        ))
+        val js = JSObject()
+                js.put("role", "server")
+                js.put("encoding", encodingStr)
+                js.put("totalBytes", totalPlain)
+                js.put("filePath", outFile?.absolutePath ?: "")
+                js.put("sha256", sha)
+                emitEvent("receiveComplete", js)
       } else {
         val bytes = memSink?.toByteArray() ?: ByteArray(0)
+        val js = JSObject()
+        js.put("role", "server")
+        js.put("encoding", encodingStr)
+        js.put("totalBytes", totalPlain)
         if (encoding == LanTransferProtocol.ENCODING_UTF8) {
-          plugin.notifyListeners("receiveComplete", mapOf(
-            "role" to "server",
-            "encoding" to "utf8",
-            "totalBytes" to totalPlain,
-            "text" to String(bytes, Charsets.UTF_8),
-            "sha256" to sha
-          ))
+           js.put("text", String(bytes, Charsets.UTF_8))
         } else {
-          plugin.notifyListeners("receiveComplete", mapOf(
-            "role" to "server",
-            "encoding" to "binary",
-            "totalBytes" to totalPlain,
-            "base64" to Base64.encodeToString(bytes, Base64.NO_WRAP),
-            "sha256" to sha
-          ))
+           js.put("base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
         }
+        js.put("sha256", sha)
+        emitEvent("receiveComplete", js)
       }
 
       output.flush()
     } catch (e: Exception) {
-      plugin.notifyListeners("error", mapOf(
-        "role" to "server",
-        "message" to ("Connection error: " + (e.message ?: e.toString())),
-        "code" to "CONNECTION_ERROR"
-      ))
+      emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
     } finally {
       socket.closeQuietly()
-      plugin.notifyListeners("status", mapOf(
-        "role" to "server",
-        "status" to "connection_closed"
+      emitStatus(mapOf(
+          "role" to "server",
+          "status" to "connection_closed"
       ))
     }
   }
 
   private fun emitReceiveProgress(bytes: Long, total: Long) {
     val percent = if (total == 0L) 100.0 else (bytes * 100.0 / total)
-    plugin.notifyListeners("progress", mapOf(
+    emitStatus(mapOf(
       "role" to "server",
       "direction" to "receive",
       "bytesTransferred" to bytes,
@@ -269,6 +249,20 @@ class LanTransferServer(
       emitReceiveProgress(transferred, totalBytes)
     }
     output.flush()
+  }
+
+  private fun emitStatus(data: Map<String, Any?>) {
+      val js = JSObject()
+      data.forEach { (k, v) -> js.put(k, v) }
+      emitEvent("status", js)
+  }
+
+  private fun emitError(code: String, message: String) {
+      val js = JSObject()
+      js.put("role", "server")
+      js.put("message", message)
+      js.put("code", code)
+      emitEvent("error", js)
   }
 
   private fun Closeable.closeQuietly() { try { close() } catch (_: Exception) {} }
