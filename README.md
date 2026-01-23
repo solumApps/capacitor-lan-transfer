@@ -38,7 +38,7 @@ npm run build
 
 ```bash
 # from your app folder
-npm i ../capacitor-lan-transfer
+npm i https://github.com/solumApps/capacitor-lan-transfer.git
 npx cap sync
 ```
 
