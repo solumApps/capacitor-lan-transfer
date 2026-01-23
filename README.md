@@ -68,6 +68,11 @@ Plugin manifest includes:
 - `android.permission.INTERNET`
 - `android.permission.ACCESS_NETWORK_STATE`
 
+Make sure to do apply these changes root build.grade file of android folder
+
+- ` buildscript { ext { kotlin_version = '1.9.24'} } `
+- ` buildscript { dependencies { classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version" } } `
+
 No runtime prompt is needed for basic LAN TCP.
 
 ---

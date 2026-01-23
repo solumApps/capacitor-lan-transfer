@@ -1,6 +1,5 @@
 # Node / TS build
 node_modules/
-dist/
 *.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
