@@ -8,11 +8,37 @@ class LanTransferPlugin : Plugin() {
 
   private var server: LanTransferServer? = null
   private var client: LanTransferClient? = null
+  private var discovery: LanTransferDiscovery? = null
 
 
   fun emit(event:String, data:JSObject){
     notifyListeners(event,data)
   }
+
+  private fun ensureDiscovery(): LanTransferDiscovery {
+    val d = discovery ?: LanTransferDiscovery(context) { ev, data -> emit(ev, data) }.also { discovery = it }
+    return d
+  }
+
+  @PluginMethod
+  fun advertise(call: PluginCall) {
+    val name = call.getString("name")
+    val port = call.getInt("port")
+    if (name.isNullOrBlank() || port == null) { call.reject("name and port are required"); return }
+    val txt = HashMap<String, String>()
+    call.getObject("txt")?.let { o -> o.keys().forEach { k -> txt[k] = o.getString(k) ?: "" } }
+    ensureDiscovery().advertise(name, port, txt)
+    call.resolve()
+  }
+
+  @PluginMethod
+  fun stopAdvertise(call: PluginCall) { discovery?.stopAdvertise(); call.resolve() }
+
+  @PluginMethod
+  fun startDiscovery(call: PluginCall) { ensureDiscovery().startDiscovery(); call.resolve() }
+
+  @PluginMethod
+  fun stopDiscovery(call: PluginCall) { discovery?.stopDiscovery(); call.resolve() }
 
 
   private fun parseCrypto(call: PluginCall): LanTransferCrypto.CryptoConfig? {
@@ -65,7 +91,12 @@ class LanTransferPlugin : Plugin() {
 
     ensureClient()
     client?.setCrypto(cryptoCfg)
-    client?.connect(host, port, sessionKey)
+    try {
+      client?.connect(host, port, sessionKey)  // blocking; throws on failure
+    } catch (e: Exception) {
+      call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
+      return
+    }
 
     call.resolve(JSObject().apply {
       put("connected", true)
@@ -122,7 +153,12 @@ class LanTransferPlugin : Plugin() {
 
     ensureClient()
     client?.setCrypto(cryptoCfg)
-    client?.connect(host, port, sessionKey)
+    try {
+      client?.connect(host, port, sessionKey)  // blocking; throws on failure
+    } catch (e: Exception) {
+      call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
+      return
+    }
 
     call.resolve(JSObject().apply {
       put("connected", true)

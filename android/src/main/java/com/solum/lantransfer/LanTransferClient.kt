@@ -26,40 +26,53 @@ class LanTransferClient(
 
   fun isConnected(): Boolean = connected.get()
 
+  /**
+   * Connects synchronously (runs on Capacitor's background thread). Resolves the
+   * plugin call only after the socket is truly connected — fixes the "first attempt
+   * after idle fails, second works" race. Closes any stale socket first, enables
+   * SO_KEEPALIVE, and retries twice (300 ms apart) before throwing.
+   */
   fun connect(host: String, port: Int, sessionKey: String?, timeoutMs: Int = 7000) {
-    executor.execute {
-      try {
-        disconnect()
+    disconnect() // close any stale socket before reconnecting
 
+    var lastErr: Exception? = null
+    var attempt = 0
+    while (attempt < 2) {
+      attempt++
+      try {
         val s = Socket()
         s.tcpNoDelay = true
+        s.keepAlive = true
         s.connect(InetSocketAddress(host, port), timeoutMs)
+
+        val out = BufferedOutputStream(s.getOutputStream())
+        LanTransferProtocol.writeHello(out, sessionKey)
+        out.flush()
 
         socket = s
         connected.set(true)
-
         plugin.emit("status", JSObject().apply {
           put("role", "client")
           put("status", "client_connected")
           put("remoteHost", host)
           put("remotePort", port)
         })
-
-        val out = BufferedOutputStream(s.getOutputStream())
-        LanTransferProtocol.writeHello(out, sessionKey)
-        out.flush()
-
+        return
       } catch (e: Exception) {
+        lastErr = e
         connected.set(false)
+        try { socket?.close() } catch (_: Exception) {}
         socket = null
-
-        plugin.emit("error", JSObject().apply {
-          put("role", "client")
-          put("code", "CONNECT_FAILED")
-          put("message", e.message ?: e.toString())
-        })
+        if (attempt < 2) { try { Thread.sleep(300) } catch (_: InterruptedException) {} }
       }
     }
+
+    plugin.emit("error", JSObject().apply {
+      put("role", "client")
+      put("code", "CONNECT_FAILED")
+      put("message", lastErr?.message ?: "connect failed")
+    })
+    throw lastErr ?: IOException("connect failed")
   }
 
 

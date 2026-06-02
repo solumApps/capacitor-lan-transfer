@@ -47,4 +47,17 @@ export class LanTransferWeb extends WebPlugin implements LanTransferPlugin {
   async sendFile(_options: SendFileOptions): Promise<void> {
     throw new Error('LanTransfer: Web is not supported.');
   }
+
+  async advertise(): Promise<void> {
+    throw new Error('LanTransfer: Web is not supported.');
+  }
+  async stopAdvertise(): Promise<void> {
+    throw new Error('LanTransfer: Web is not supported.');
+  }
+  async startDiscovery(): Promise<void> {
+    throw new Error('LanTransfer: Web is not supported.');
+  }
+  async stopDiscovery(): Promise<void> {
+    throw new Error('LanTransfer: Web is not supported.');
+  }
 }

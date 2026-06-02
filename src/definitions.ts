@@ -116,6 +116,27 @@ export interface ErrorEvent {
   code?: string;
 }
 
+export interface AdvertiseOptions {
+  /** Unique instance name shown in the scan list, e.g. "Newton-LCD-01". */
+  name: string;
+  /** Port the file server listens on (same as startServer). */
+  port: number;
+  /** TXT records to distinguish devices, e.g. { deviceName, storeId, appVersion }. */
+  txt?: Record<string, string>;
+}
+
+/** Emitted on the scanning (mobile) side as services are resolved/lost. */
+export interface DeviceFoundEvent {
+  name: string;        // NSD instance name
+  host: string;        // resolved IPv4
+  port: number;
+  // plus any TXT keys (deviceName, storeId, appVersion, …)
+  [key: string]: string | number;
+}
+export interface DeviceLostEvent {
+  name: string;
+}
+
 export interface LanTransferPlugin {
   initialize(options: InitializeOptions): Promise<ServerInfo | ConnectionInfo>;
 
@@ -132,6 +153,24 @@ export interface LanTransferPlugin {
   sendString(options: SendStringOptions): Promise<void>;
   sendBase64(options: SendBase64Options): Promise<void>;
   sendFile(options: SendFileOptions): Promise<void>;
+
+  // ---- mDNS/NSD discovery ----
+  /** LCD: advertise this device on the LAN so mobile apps can find it. */
+  advertise(options: AdvertiseOptions): Promise<void>;
+  stopAdvertise(): Promise<void>;
+  /** Mobile: scan for advertising devices; results arrive via 'deviceFound'/'deviceLost'. */
+  startDiscovery(): Promise<void>;
+  stopDiscovery(): Promise<void>;
+
+  addListener(
+    eventName: 'deviceFound',
+    listenerFunc: (event: DeviceFoundEvent) => void
+  ): Promise<{ remove: () => Promise<void> }>;
+
+  addListener(
+    eventName: 'deviceLost',
+    listenerFunc: (event: DeviceLostEvent) => void
+  ): Promise<{ remove: () => Promise<void> }>;
 
   addListener(
     eventName: 'progress',

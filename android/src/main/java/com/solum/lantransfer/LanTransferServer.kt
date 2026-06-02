@@ -37,7 +37,11 @@ class LanTransferServer(
 
     executor.execute {
       try {
-        val ss = ServerSocket(port)
+        // reuseAddress so a quick restart (or TIME_WAIT after idle) can re-bind the
+        // port immediately — avoids the server being un-connectable for ~60s.
+        val ss = ServerSocket()
+        ss.reuseAddress = true
+        ss.bind(java.net.InetSocketAddress(port))
         serverSocket = ss
 
         emitStatus(
@@ -51,6 +55,8 @@ class LanTransferServer(
 
         while (running.get()) {
           val socket = ss.accept()
+          socket.keepAlive = true
+          socket.tcpNoDelay = true
           activeSocket?.closeQuietly()
           activeSocket = socket
 
