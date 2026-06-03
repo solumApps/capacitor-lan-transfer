@@ -4,4 +4,8 @@
   <!-- NSD/mDNS advertise + scan -->
   <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
   <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+  <!-- Android 13+ (API 33): NsdManager discovery/resolve requires NEARBY_WIFI_DEVICES.
+       neverForLocation = we don't derive physical location from it. -->
+  <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+                   android:usesPermissionFlags="neverForLocation" />
 </manifest>

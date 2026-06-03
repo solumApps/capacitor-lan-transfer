@@ -27,6 +27,7 @@ class LanTransferDiscovery(
   // ---------- ADVERTISE (LCD) ----------
   fun advertise(instanceName: String, port: Int, txt: Map<String, String>) {
     stopAdvertise()
+    acquireMulticastLock()   // so the LCD can answer multicast mDNS queries reliably
     val info = NsdServiceInfo().apply {
       serviceName = instanceName
       serviceType = SERVICE_TYPE
@@ -50,6 +51,7 @@ class LanTransferDiscovery(
   fun stopAdvertise() {
     regListener?.let { try { nsd.unregisterService(it) } catch (_: Exception) {} }
     regListener = null
+    if (discListener == null) releaseMulticastLock()   // keep lock if a scan is also running
   }
 
   // ---------- DISCOVER (mobile) ----------
@@ -63,7 +65,7 @@ class LanTransferDiscovery(
         emit("error", JSObject().apply { put("code", "DISCOVERY_FAILED"); put("message", "start failed: $code") })
       }
       override fun onStopDiscoveryFailed(t: String, code: Int) {}
-      override fun onServiceFound(s: NsdServiceInfo) { resolve(s) }
+      override fun onServiceFound(s: NsdServiceInfo) { enqueueResolve(s) }
       override fun onServiceLost(s: NsdServiceInfo) {
         emit("deviceLost", JSObject().apply { put("name", s.serviceName) })
       }
@@ -75,17 +77,31 @@ class LanTransferDiscovery(
   fun stopDiscovery() {
     discListener?.let { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
     discListener = null
-    releaseMulticastLock()
+    synchronized(this) { resolveQueue.clear(); resolving = false }
+    if (regListener == null) releaseMulticastLock()   // keep lock if still advertising
   }
 
-  // A fresh ResolveListener per service (NSD allows only one active resolve at a time;
-  // retry once on FAILURE_ALREADY_ACTIVE).
-  private fun resolve(service: NsdServiceInfo) {
+  // NSD allows only ONE active resolve at a time — concurrent resolveService() calls
+  // fail silently. Serialize them through a queue (the classic NSD-discovery fix).
+  private val resolveQueue = ArrayDeque<NsdServiceInfo>()
+  private var resolving = false
+
+  @Synchronized private fun enqueueResolve(service: NsdServiceInfo) {
+    resolveQueue.addLast(service)
+    pumpResolve()
+  }
+
+  @Synchronized private fun pumpResolve() {
+    if (resolving) return
+    val service = resolveQueue.removeFirstOrNull() ?: return
+    resolving = true
     val listener = object : NsdManager.ResolveListener {
       override fun onResolveFailed(s: NsdServiceInfo, code: Int) {
         if (code == NsdManager.FAILURE_ALREADY_ACTIVE) {
-          try { Thread.sleep(150) } catch (_: InterruptedException) {}
-          try { nsd.resolveService(s, this) } catch (_: Exception) {}
+          try { Thread.sleep(200) } catch (_: InterruptedException) {}
+          synchronized(this@LanTransferDiscovery) { resolveQueue.addLast(s); resolving = false; pumpResolve() }
+        } else {
+          synchronized(this@LanTransferDiscovery) { resolving = false; pumpResolve() }
         }
       }
       override fun onServiceResolved(s: NsdServiceInfo) {
@@ -96,9 +112,11 @@ class LanTransferDiscovery(
           s.attributes?.forEach { (k, v) -> put(k, v?.let { String(it, Charsets.UTF_8) } ?: "") }
         }
         emit("deviceFound", data)
+        synchronized(this@LanTransferDiscovery) { resolving = false; pumpResolve() }
       }
     }
-    try { nsd.resolveService(service, listener) } catch (_: Exception) {}
+    try { nsd.resolveService(service, listener) }
+    catch (_: Exception) { resolving = false; pumpResolve() }
   }
 
   private fun acquireMulticastLock() {

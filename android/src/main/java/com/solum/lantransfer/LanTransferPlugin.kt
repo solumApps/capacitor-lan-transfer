@@ -1,9 +1,19 @@
 package com.solum.lantransfer
 
+import android.Manifest
+import android.os.Build
 import com.getcapacitor.*
+import com.getcapacitor.PermissionState
 import com.getcapacitor.annotation.CapacitorPlugin
+import com.getcapacitor.annotation.Permission
+import com.getcapacitor.annotation.PermissionCallback
 
-@CapacitorPlugin(name = "LanTransfer")
+@CapacitorPlugin(
+  name = "LanTransfer",
+  permissions = [
+    Permission(alias = "nearby", strings = [Manifest.permission.NEARBY_WIFI_DEVICES])
+  ]
+)
 class LanTransferPlugin : Plugin() {
 
   private var server: LanTransferServer? = null
@@ -35,7 +45,23 @@ class LanTransferPlugin : Plugin() {
   fun stopAdvertise(call: PluginCall) { discovery?.stopAdvertise(); call.resolve() }
 
   @PluginMethod
-  fun startDiscovery(call: PluginCall) { ensureDiscovery().startDiscovery(); call.resolve() }
+  fun startDiscovery(call: PluginCall) {
+    // Android 13+ requires NEARBY_WIFI_DEVICES for NSD discovery/resolve, else it
+    // silently returns nothing. Request it once, then start.
+    if (Build.VERSION.SDK_INT >= 33 && getPermissionState("nearby") != PermissionState.GRANTED) {
+      requestPermissionForAlias("nearby", call, "onNearbyResult")
+      return
+    }
+    ensureDiscovery().startDiscovery()
+    call.resolve()
+  }
+
+  @PermissionCallback
+  private fun onNearbyResult(call: PluginCall) {
+    // Proceed regardless — if denied, discovery just yields nothing and manual IP still works.
+    ensureDiscovery().startDiscovery()
+    call.resolve()
+  }
 
   @PluginMethod
   fun stopDiscovery(call: PluginCall) { discovery?.stopDiscovery(); call.resolve() }
