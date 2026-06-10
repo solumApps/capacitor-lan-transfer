@@ -8,6 +8,8 @@ import type {
   SendBase64Options,
   SendFileOptions,
   SetReceiveModeOptions,
+  NetworkInfo,
+  CheckReachableResult,
 } from './definitions';
 
 export class LanTransferWeb extends WebPlugin implements LanTransferPlugin {
@@ -59,5 +61,12 @@ export class LanTransferWeb extends WebPlugin implements LanTransferPlugin {
   }
   async stopDiscovery(): Promise<void> {
     throw new Error('LanTransfer: Web is not supported.');
+  }
+
+  async getNetworkInfo(): Promise<NetworkInfo> {
+    return { ip: '0.0.0.0', interfaces: [] };
+  }
+  async checkReachable(): Promise<CheckReachableResult> {
+    return { reachable: false };
   }
 }

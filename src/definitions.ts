@@ -125,16 +125,48 @@ export interface AdvertiseOptions {
   txt?: Record<string, string>;
 }
 
-/** Emitted on the scanning (mobile) side as services are resolved/lost. */
+/** Emitted on the scanning (mobile) side as services are resolved/lost.
+ *  Devices can be found via mDNS (primary) or the UDP broadcast fallback
+ *  (`via: 'udp'`) — the fallback works on phone hotspots and APs that filter
+ *  multicast. Dedupe by `name`. */
 export interface DeviceFoundEvent {
   name: string;        // NSD instance name
   host: string;        // resolved IPv4
   port: number;
+  via?: 'mdns' | 'udp' | string;
   // plus any TXT keys (deviceName, storeId, appVersion, …)
-  [key: string]: string | number;
+  [key: string]: string | number | undefined;
 }
 export interface DeviceLostEvent {
   name: string;
+}
+
+export interface NetworkInterfaceInfo {
+  /** OS interface name, e.g. wlan0, ap0, swlan0, eth0 (Android) / en0, bridge100 (iOS). */
+  name: string;
+  /** IPv4 address on that interface. */
+  ip: string;
+  /** CIDR prefix length, when known (Android). */
+  prefixLength?: number;
+}
+
+export interface NetworkInfo {
+  /** Best single IPv4 (Wi-Fi preferred, hotspot/AP next, cellular last). */
+  ip: string;
+  /** Every usable non-loopback IPv4 — show ALL of these on a pairing screen. */
+  interfaces: NetworkInterfaceInfo[];
+}
+
+export interface CheckReachableOptions {
+  host: string;
+  port: number;
+  /** Default 2500 ms. */
+  timeoutMs?: number;
+}
+
+export interface CheckReachableResult {
+  reachable: boolean;
+  latencyMs?: number;
 }
 
 export interface LanTransferPlugin {
@@ -154,13 +186,20 @@ export interface LanTransferPlugin {
   sendBase64(options: SendBase64Options): Promise<void>;
   sendFile(options: SendFileOptions): Promise<void>;
 
-  // ---- mDNS/NSD discovery ----
-  /** LCD: advertise this device on the LAN so mobile apps can find it. */
+  // ---- layered discovery (mDNS/NSD primary + UDP broadcast fallback) ----
+  /** LCD: advertise this device on the LAN (mDNS + UDP responder on :53517). */
   advertise(options: AdvertiseOptions): Promise<void>;
   stopAdvertise(): Promise<void>;
-  /** Mobile: scan for advertising devices; results arrive via 'deviceFound'/'deviceLost'. */
+  /** Mobile: scan for advertising devices (mDNS browse + UDP broadcast probes);
+   *  results arrive via 'deviceFound'/'deviceLost'. */
   startDiscovery(): Promise<void>;
   stopDiscovery(): Promise<void>;
+
+  /** Enumerate all non-loopback IPv4 interfaces (works in hotspot/AP mode too). */
+  getNetworkInfo(): Promise<NetworkInfo>;
+  /** TCP connect probe — distinguishes "wrong IP / offline" from
+   *  "network blocks device-to-device traffic (client isolation)". */
+  checkReachable(options: CheckReachableOptions): Promise<CheckReachableResult>;
 
   addListener(
     eventName: 'deviceFound',

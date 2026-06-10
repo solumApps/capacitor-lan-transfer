@@ -1,5 +1,5 @@
 import { WebPlugin } from '@capacitor/core';
-import type { LanTransferPlugin, InitializeOptions, ServerInfo, ConnectionInfo, SendStringOptions, SendBase64Options, SendFileOptions, SetReceiveModeOptions } from './definitions';
+import type { LanTransferPlugin, InitializeOptions, ServerInfo, ConnectionInfo, SendStringOptions, SendBase64Options, SendFileOptions, SetReceiveModeOptions, NetworkInfo, CheckReachableResult } from './definitions';
 export declare class LanTransferWeb extends WebPlugin implements LanTransferPlugin {
     initialize(_options: InitializeOptions): Promise<ServerInfo | ConnectionInfo>;
     startServer(): Promise<ServerInfo>;
@@ -12,4 +12,10 @@ export declare class LanTransferWeb extends WebPlugin implements LanTransferPlug
     sendString(_options: SendStringOptions): Promise<void>;
     sendBase64(_options: SendBase64Options): Promise<void>;
     sendFile(_options: SendFileOptions): Promise<void>;
+    advertise(): Promise<void>;
+    stopAdvertise(): Promise<void>;
+    startDiscovery(): Promise<void>;
+    stopDiscovery(): Promise<void>;
+    getNetworkInfo(): Promise<NetworkInfo>;
+    checkReachable(): Promise<CheckReachableResult>;
 }

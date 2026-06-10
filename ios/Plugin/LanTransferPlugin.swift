@@ -5,6 +5,7 @@ import Capacitor
 public class LanTransferPlugin: CAPPlugin {
   private let server = LanTransferServer()
   private let client = LanTransferClient()
+  private let discovery = LanTransferDiscovery()
 
   public override func load() {
     server.onStatus = { [weak self] obj in self?.notifyListeners("status", data: obj) }
@@ -15,6 +16,84 @@ public class LanTransferPlugin: CAPPlugin {
     client.onStatus = { [weak self] obj in self?.notifyListeners("status", data: obj) }
     client.onProgress = { [weak self] obj in self?.notifyListeners("progress", data: obj) }
     client.onError = { [weak self] obj in self?.notifyListeners("error", data: obj) }
+
+    discovery.onEvent = { [weak self] event, data in
+      self?.notifyListeners(event, data: data)
+    }
+  }
+
+  // MARK: - Discovery (Bonjour + UDP broadcast fallback)
+
+  @objc func advertise(_ call: CAPPluginCall) {
+    guard let name = call.getString("name"), let port = call.getInt("port") else {
+      call.reject("name and port are required"); return
+    }
+    var txt: [String: String] = [:]
+    if let o = call.getObject("txt") {
+      for (k, v) in o { txt[k] = "\(v)" }
+    }
+    discovery.advertise(name: name, port: port, txt: txt)
+    call.resolve()
+  }
+
+  @objc func stopAdvertise(_ call: CAPPluginCall) {
+    discovery.stopAdvertise()
+    call.resolve()
+  }
+
+  @objc func startDiscovery(_ call: CAPPluginCall) {
+    discovery.startDiscovery()
+    call.resolve()
+  }
+
+  @objc func stopDiscovery(_ call: CAPPluginCall) {
+    discovery.stopDiscovery()
+    call.resolve()
+  }
+
+  // MARK: - Network info / reachability
+
+  @objc func getNetworkInfo(_ call: CAPPluginCall) {
+    let interfaces = NetUtils.allIPv4Addresses().map { i -> [String: Any] in
+      ["name": i.name, "ip": i.ip]
+    }
+    call.resolve([
+      "ip": NetUtils.localIPv4Address(),
+      "interfaces": interfaces
+    ])
+  }
+
+  @objc func checkReachable(_ call: CAPPluginCall) {
+    guard let host = call.getString("host"), let port = call.getInt("port") else {
+      call.reject("host and port are required"); return
+    }
+    let timeoutMs = call.getInt("timeoutMs") ?? 2500
+    DispatchQueue.global(qos: .utility).async {
+      let started = Date()
+      let fd = socket(AF_INET, SOCK_STREAM, 0)
+      var ok = false
+      if fd >= 0 {
+        var tv = timeval(tv_sec: timeoutMs / 1000, tv_usec: Int32((timeoutMs % 1000) * 1000))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        if inet_pton(AF_INET, host, &addr.sin_addr) == 1 {
+          let res = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+              connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+          }
+          ok = (res == 0)
+        }
+        close(fd)
+      }
+      call.resolve([
+        "reachable": ok,
+        "latencyMs": Int(Date().timeIntervalSince(started) * 1000)
+      ])
+    }
   }
 
   private func parseCrypto(_ call: CAPPluginCall) -> LanTransferCrypto.CryptoConfig? {

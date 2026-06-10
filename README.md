@@ -7,6 +7,12 @@ Capacitor (Android + iOS) plugin for **large LAN TCP transfers** with:
 - Streaming transfers with **progress** events
 - Optional **AES‑256‑GCM encryption** (PBKDF2 key derivation, streaming chunks)
 - **SHA‑256 integrity hash** of **PLAINTEXT** on sender and receiver
+- **Layered discovery** (since 0.2.0): mDNS/Bonjour primary + **UDP broadcast fallback**
+  (works on phone hotspots and APs that filter multicast) + manual IP as last resort
+- **Interface enumeration** (`getNetworkInfo`) that works in **hotspot/AP mode**
+  (never relies on `WifiManager.getConnectionInfo`, which returns 0.0.0.0 in AP mode)
+- **TCP reachability probe** (`checkReachable`) to tell "wrong IP / offline" apart
+  from "AP blocks device‑to‑device traffic (client isolation)"
 
 > Web is not supported.
 
@@ -48,12 +54,20 @@ npx cap sync
 
 ### iOS (required)
 
-In your host app: `ios/App/App/Info.plist` add:
+In your host app `ios/App/App/Info.plist` add **both** keys (required on iOS 14+
+for any local-network traffic AND for Bonjour browse/advertise):
 
-- `NSLocalNetworkUsageDescription` (String)
+```xml
+<key>NSLocalNetworkUsageDescription</key>
+<string>This app discovers and transfers content to displays on your local network.</string>
+<key>NSBonjourServices</key>
+<array>
+  <string>_newtontouch._tcp</string>
+</array>
+```
 
-Example value:
-> "This app transfers data to another device on your local network."
+> The Bonjour service type must match what the plugin uses: `_newtontouch._tcp`.
+> Without `NSBonjourServices`, `startDiscovery()`/`advertise()` silently find nothing on iOS 14+.
 
 Then:
 
@@ -63,17 +77,64 @@ npx cap sync ios
 
 ### Android
 
-Plugin manifest includes:
+The plugin's library manifest declares (merged into your app automatically):
 
 - `android.permission.INTERNET`
 - `android.permission.ACCESS_NETWORK_STATE`
+- `android.permission.ACCESS_WIFI_STATE` (MulticastLock)
+- `android.permission.CHANGE_WIFI_MULTICAST_STATE` (required to RECEIVE mDNS/UDP multicast)
+- `android.permission.NEARBY_WIFI_DEVICES` with `neverForLocation` (Android 13+ NSD)
 
-Make sure to do apply these changes root build.grade file of android folder
+On Android 13+ the plugin requests `NEARBY_WIFI_DEVICES` at runtime the first time
+`startDiscovery()` is called. If the user denies it, mDNS discovery yields nothing
+but the **UDP broadcast fallback and manual IP connect still work**.
+
+Make sure to apply these changes to the root build.gradle file of the android folder:
 
 - ` buildscript { ext { kotlin_version = '1.9.24'} } `
 - ` buildscript { dependencies { classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version" } } `
 
 No runtime prompt is needed for basic LAN TCP.
+
+---
+
+## Discovery (since 0.2.0)
+
+Discovery is **layered** so it works across AP types:
+
+1. **mDNS / NSD / Bonjour** (primary) — service type `_newtontouch._tcp.`, TXT records included.
+2. **UDP broadcast probe** (fallback, automatic) — the advertising side listens on UDP
+   `53517`; the scanning side broadcasts `NTLT1?` to `255.255.255.255` **and** every
+   subnet‑directed broadcast address every 2 s; the advertiser replies unicast with
+   `NTLT1!{json}` containing its name, the IP **on the prober's subnet**, port and TXT
+   data. This path works on **phone hotspots** and APs that filter multicast.
+3. **Manual IP** — `getNetworkInfo()` on the receiver lists every local IPv4 to show on
+   a pairing screen; the sender connects directly with `connect({ host, port })`.
+
+```ts
+// Receiver (advertise) — server binds 0.0.0.0, so one server covers all interfaces:
+await LanTransfer.startServer({ port: 8082 });
+await LanTransfer.advertise({ name: 'Newton-LCD-01', port: 8082, txt: { deviceName: 'Lobby' } });
+const net = await LanTransfer.getNetworkInfo();   // every non-loopback IPv4 (incl. ap0/swlan0/bridge100)
+
+// Sender (scan):
+await LanTransfer.addListener('deviceFound', d => console.log(d.name, d.host, d.port, d.via)); // via: 'mdns' | 'udp'
+await LanTransfer.addListener('deviceLost', d => console.log('lost', d.name));
+await LanTransfer.startDiscovery();
+// later: await LanTransfer.stopDiscovery(); await LanTransfer.stopAdvertise();
+
+// Sender (diagnose a failed connect):
+const r = await LanTransfer.checkReachable({ host: '192.168.43.17', port: 8082, timeoutMs: 2500 });
+```
+
+### No‑AP / hotspot mode
+
+When there is no usable Wi‑Fi AP: enable the **phone hotspot** and join the
+receiver (LCD) to it. mDNS is often blocked on hotspots, but the **UDP fallback is
+not** — the receiver appears in the scan with `via: 'udp'`. Manual IP also works:
+the receiver's hotspot address (typically `192.168.43.x` / `172.20.10.x`) is listed
+by `getNetworkInfo()`. The transfer server binds `0.0.0.0`, so no extra setup is
+needed on either side.
 
 ---
 
@@ -332,15 +393,26 @@ npx cap open ios
 
 ### iOS: cannot connect / no LAN prompt
 
-- Ensure `NSLocalNetworkUsageDescription` exists in `Info.plist`.
+- Ensure `NSLocalNetworkUsageDescription` **and** `NSBonjourServices` (`_newtontouch._tcp`) exist in `Info.plist`.
 - Ensure both devices are on the same Wi‑Fi.
-- Some networks block device-to-device traffic (AP isolation).
+- Some networks block device-to-device traffic (AP isolation) — see below.
 
 ### Android: connection refused
 
 - Verify server IP/port printed by the server.
 - Ensure both devices are on same Wi‑Fi subnet.
 - Ensure you're not trying to use a cellular IP.
+
+### Nothing found while scanning
+
+- Many APs (guest networks, enterprise Wi‑Fi, hotspots) filter multicast → mDNS is dead,
+  but the UDP fallback should still find devices (`via: 'udp'`). If even UDP finds
+  nothing, the AP probably has **client isolation** — use `checkReachable` to confirm:
+  if the gateway answers but the peer doesn't, isolation is the cause. Workaround:
+  **phone hotspot** (enable on the phone, join the display to it), or manual IP on a
+  network that allows peer traffic.
+- Android 13+: make sure the `NEARBY_WIFI_DEVICES` runtime permission wasn't denied
+  (Settings → Apps → your app → Permissions → Nearby devices).
 
 ### Progress stuck / incorrect
 

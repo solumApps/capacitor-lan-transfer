@@ -66,6 +66,45 @@ class LanTransferPlugin : Plugin() {
   @PluginMethod
   fun stopDiscovery(call: PluginCall) { discovery?.stopDiscovery(); call.resolve() }
 
+  /** All non-loopback IPv4 interfaces (wlan/ap/eth/...), best first — lets the LCD
+   *  pairing screen show every reachable address (incl. hotspot interfaces). */
+  @PluginMethod
+  fun getNetworkInfo(call: PluginCall) {
+    val arr = JSArray()
+    NetUtils.getLocalIpv4Addresses().forEach { i ->
+      arr.put(JSObject().apply {
+        put("name", i.name)
+        put("ip", i.ip)
+        put("prefixLength", i.prefixLength)
+      })
+    }
+    call.resolve(JSObject().apply {
+      put("ip", NetUtils.getLocalIpv4Address())
+      put("interfaces", arr)
+    })
+  }
+
+  /** TCP reachability probe (connect+close). Used by the sender to distinguish
+   *  "peer offline / wrong IP" from "AP blocks device-to-device traffic". */
+  @PluginMethod
+  fun checkReachable(call: PluginCall) {
+    val host = call.getString("host") ?: return call.reject("host is required")
+    val port = call.getInt("port") ?: return call.reject("port is required")
+    val timeout = call.getInt("timeoutMs") ?: 2500
+    Thread({
+      val started = System.currentTimeMillis()
+      var ok = false
+      try {
+        java.net.Socket().use { s -> s.connect(java.net.InetSocketAddress(host, port), timeout) }
+        ok = true
+      } catch (_: Exception) {}
+      call.resolve(JSObject().apply {
+        put("reachable", ok)
+        put("latencyMs", System.currentTimeMillis() - started)
+      })
+    }, "ntlt-reach-probe").start()
+  }
+
 
   private fun parseCrypto(call: PluginCall): LanTransferCrypto.CryptoConfig? {
     val enc = call.getObject("encryption") ?: return null

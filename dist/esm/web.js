@@ -33,4 +33,22 @@ export class LanTransferWeb extends WebPlugin {
     async sendFile(_options) {
         throw new Error('LanTransfer: Web is not supported.');
     }
+    async advertise() {
+        throw new Error('LanTransfer: Web is not supported.');
+    }
+    async stopAdvertise() {
+        throw new Error('LanTransfer: Web is not supported.');
+    }
+    async startDiscovery() {
+        throw new Error('LanTransfer: Web is not supported.');
+    }
+    async stopDiscovery() {
+        throw new Error('LanTransfer: Web is not supported.');
+    }
+    async getNetworkInfo() {
+        return { ip: '0.0.0.0', interfaces: [] };
+    }
+    async checkReachable() {
+        return { reachable: false };
+    }
 }

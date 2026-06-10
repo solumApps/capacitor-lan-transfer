@@ -1,6 +1,6 @@
 {
   "name": "capacitor-lan-transfer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Capacitor plugin for large LAN TCP transfer (server/client) with progress, optional AES-GCM, and SHA-256 integrity.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
