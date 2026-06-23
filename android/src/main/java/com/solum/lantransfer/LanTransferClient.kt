@@ -43,6 +43,8 @@ class LanTransferClient(
         val s = Socket()
         s.tcpNoDelay = true
         s.keepAlive = true
+        // Large send buffer → higher LAN throughput on big media transfers.
+        try { s.sendBufferSize = 1 shl 20 } catch (_: Exception) {}
         s.connect(InetSocketAddress(host, port), timeoutMs)
 
         val out = BufferedOutputStream(s.getOutputStream())
@@ -136,8 +138,10 @@ class LanTransferClient(
           val digest = MessageDigest.getInstance("SHA-256")
 
           if (!encrypted) {
-            val buffer = ByteArray(64 * 1024)
+            // 256 KB buffer (was 64 KB) → fewer loop iterations / syscalls.
+            val buffer = ByteArray(256 * 1024)
             var plainSent = 0L
+            var lastEmit = 0L
             while (plainSent < totalPlain) {
               val remaining = totalPlain - plainSent
               val toRead = if (remaining < buffer.size) remaining.toInt() else buffer.size
@@ -148,7 +152,11 @@ class LanTransferClient(
               out.write(buffer, 0, read)
 
               plainSent += read.toLong()
-              emitProgress(plainSent, totalPlain)
+              // Throttle progress: emit at most every ~1 MB (or at the end).
+              // Per-64KB emits flood the Capacitor bridge and slow the transfer.
+              if (plainSent - lastEmit >= 1_048_576L || plainSent >= totalPlain) {
+                emitProgress(plainSent, totalPlain); lastEmit = plainSent
+              }
             }
 
             out.flush()

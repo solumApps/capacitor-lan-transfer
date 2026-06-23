@@ -57,6 +57,8 @@ class LanTransferServer(
           val socket = ss.accept()
           socket.keepAlive = true
           socket.tcpNoDelay = true
+          // Large receive buffer → higher LAN throughput on big media transfers.
+          try { socket.receiveBufferSize = 1 shl 20 } catch (_: Exception) {}
           activeSocket?.closeQuietly()
           activeSocket = socket
 
@@ -239,8 +241,10 @@ class LanTransferServer(
     totalBytes: Long,
     digest: MessageDigest
   ) {
-    val buffer = ByteArray(64 * 1024)
+    // 256 KB buffer (was 64 KB) → fewer iterations / syscalls.
+    val buffer = ByteArray(256 * 1024)
     var transferred = 0L
+    var lastEmit = 0L
 
     while (transferred < totalBytes) {
       val remaining = totalBytes - transferred
@@ -252,7 +256,11 @@ class LanTransferServer(
       output.write(buffer, 0, read)
       transferred += read.toLong()
 
-      emitReceiveProgress(transferred, totalBytes)
+      // Throttle progress: at most every ~1 MB (or at the end). Per-64KB emits
+      // flood the Capacitor bridge — costly on the memory-constrained LCD.
+      if (transferred - lastEmit >= 1_048_576L || transferred >= totalBytes) {
+        emitReceiveProgress(transferred, totalBytes); lastEmit = transferred
+      }
     }
     output.flush()
   }
