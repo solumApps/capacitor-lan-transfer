@@ -158,6 +158,9 @@ export interface LanTransferPlugin {
     stopDiscovery(): Promise<void>;
     /** Enumerate all non-loopback IPv4 interfaces (works in hotspot/AP mode too). */
     getNetworkInfo(): Promise<NetworkInfo>;
+    /** Android: open the system Wi-Fi settings screen so the user can turn Wi-Fi on
+     *  without leaving the app. No-op rejection on web/iOS. */
+    openWifiSettings(): Promise<void>;
     /** TCP connect probe — distinguishes "wrong IP / offline" from
      *  "network blocks device-to-device traffic (client isolation)". */
     checkReachable(options: CheckReachableOptions): Promise<CheckReachableResult>;

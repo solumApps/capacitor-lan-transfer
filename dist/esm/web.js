@@ -48,6 +48,9 @@ export class LanTransferWeb extends WebPlugin {
     async getNetworkInfo() {
         return { ip: '0.0.0.0', interfaces: [] };
     }
+    async openWifiSettings() {
+        throw new Error('LanTransfer: Web is not supported.');
+    }
     async checkReachable() {
         return { reachable: false };
     }

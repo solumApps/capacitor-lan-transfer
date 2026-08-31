@@ -66,6 +66,9 @@ export class LanTransferWeb extends WebPlugin implements LanTransferPlugin {
   async getNetworkInfo(): Promise<NetworkInfo> {
     return { ip: '0.0.0.0', interfaces: [] };
   }
+  async openWifiSettings(): Promise<void> {
+    throw new Error('LanTransfer: Web is not supported.');
+  }
   async checkReachable(): Promise<CheckReachableResult> {
     return { reachable: false };
   }

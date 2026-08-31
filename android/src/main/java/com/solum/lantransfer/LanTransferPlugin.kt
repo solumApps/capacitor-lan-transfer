@@ -1,7 +1,9 @@
 package com.solum.lantransfer
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
+import android.provider.Settings
 import com.getcapacitor.*
 import com.getcapacitor.PermissionState
 import com.getcapacitor.annotation.CapacitorPlugin
@@ -82,6 +84,26 @@ class LanTransferPlugin : Plugin() {
       put("ip", NetUtils.getLocalIpv4Address())
       put("interfaces", arr)
     })
+  }
+
+  /** Android 10+ (API 29+) blocks apps from toggling Wi-Fi directly via
+   *  WifiManager.setWifiEnabled() — it's a silent no-op. Opens the full Wi-Fi
+   *  settings screen so the user can turn it on and connect; the quick
+   *  Settings.Panel.ACTION_WIFI bottom-sheet was tried first but its toggle
+   *  doesn't respond reliably on target hardware, so the full screen is used
+   *  directly instead of as a fallback.
+   *
+   *  Uses the application Context (not the host Activity) so this module doesn't
+   *  need androidx.appcompat on its own compile classpath — that requires the
+   *  NEW_TASK flag since we're launching outside an Activity context. */
+  @PluginMethod
+  fun openWifiSettings(call: PluginCall) {
+    try {
+      context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+      call.resolve()
+    } catch (e: Exception) {
+      call.reject(e.message ?: "Unable to open Wi-Fi settings")
+    }
   }
 
   /** TCP reachability probe (connect+close). Used by the sender to distinguish
