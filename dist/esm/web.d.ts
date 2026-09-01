@@ -18,5 +18,9 @@ export declare class LanTransferWeb extends WebPlugin implements LanTransferPlug
     stopDiscovery(): Promise<void>;
     getNetworkInfo(): Promise<NetworkInfo>;
     openWifiSettings(): Promise<void>;
+    isHotspotSupported(): Promise<{
+        supported: boolean;
+    }>;
+    openHotspotSettings(): Promise<void>;
     checkReachable(): Promise<CheckReachableResult>;
 }

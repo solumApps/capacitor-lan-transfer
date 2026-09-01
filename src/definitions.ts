@@ -200,6 +200,12 @@ export interface LanTransferPlugin {
   /** Android: open the system Wi-Fi settings screen so the user can turn Wi-Fi on
    *  without leaving the app. No-op rejection on web/iOS. */
   openWifiSettings(): Promise<void>;
+  /** Android: returns { supported: boolean } indicating whether the device supports
+   *  Wi-Fi hotspot / tethering. Returns false on web/iOS. */
+  isHotspotSupported(): Promise<{ supported: boolean }>;
+  /** Android: open the system Hotspot / Tethering settings screen directly.
+   *  No-op rejection on web/iOS. */
+  openHotspotSettings(): Promise<void>;
   /** TCP connect probe — distinguishes "wrong IP / offline" from
    *  "network blocks device-to-device traffic (client isolation)". */
   checkReachable(options: CheckReachableOptions): Promise<CheckReachableResult>;

@@ -1,7 +1,9 @@
 package com.solum.lantransfer
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
 import com.getcapacitor.*
@@ -86,24 +88,92 @@ class LanTransferPlugin : Plugin() {
     })
   }
 
-  /** Android 10+ (API 29+) blocks apps from toggling Wi-Fi directly via
-   *  WifiManager.setWifiEnabled() — it's a silent no-op. Opens the full Wi-Fi
-   *  settings screen so the user can turn it on and connect; the quick
-   *  Settings.Panel.ACTION_WIFI bottom-sheet was tried first but its toggle
-   *  doesn't respond reliably on target hardware, so the full screen is used
-   *  directly instead of as a fallback.
-   *
-   *  Uses the application Context (not the host Activity) so this module doesn't
-   *  need androidx.appcompat on its own compile classpath — that requires the
-   *  NEW_TASK flag since we're launching outside an Activity context. */
+  /** Opens the full system Wi-Fi settings screen (Settings.ACTION_WIFI_SETTINGS).
+   *  Uses the foreground Activity context (activity ?: context) so Samsung One UI,
+   *  tablets, and Android 14+ (API 34–36) Background Activity Launch (BAL) rules
+   *  cleanly allow the window transition.
+   *  Includes fallbacks to ACTION_WIRELESS_SETTINGS and ACTION_SETTINGS. */
   @PluginMethod
   fun openWifiSettings(call: PluginCall) {
+    android.util.Log.d("LanTransfer", "openWifiSettings called: activity=$activity, context=$context")
+    val act = activity ?: context
     try {
-      context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+      val wifiIntent = Intent(Settings.ACTION_WIFI_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+      }
+      act.startActivity(wifiIntent)
+      android.util.Log.d("LanTransfer", "openWifiSettings: launched ACTION_WIFI_SETTINGS")
       call.resolve()
     } catch (e: Exception) {
-      call.reject(e.message ?: "Unable to open Wi-Fi settings")
+      android.util.Log.w("LanTransfer", "ACTION_WIFI_SETTINGS failed: ${e.message}")
+      try {
+        val wirelessIntent = Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        act.startActivity(wirelessIntent)
+        android.util.Log.d("LanTransfer", "openWifiSettings: launched ACTION_WIRELESS_SETTINGS")
+        call.resolve()
+      } catch (e2: Exception) {
+        android.util.Log.w("LanTransfer", "ACTION_WIRELESS_SETTINGS failed: ${e2.message}")
+        try {
+          val settingsIntent = Intent(Settings.ACTION_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+          }
+          act.startActivity(settingsIntent)
+          android.util.Log.d("LanTransfer", "openWifiSettings: launched ACTION_SETTINGS")
+          call.resolve()
+        } catch (e3: Exception) {
+          android.util.Log.e("LanTransfer", "all settings intents failed: ${e3.message}")
+          call.reject(e3.message ?: "Unable to open Wi-Fi settings")
+        }
+      }
     }
+  }
+
+  /** Returns { supported: true/false } indicating whether this device has a
+   *  Wi-Fi hotspot / tethering feature that the user can enable.
+   *  Checks by querying whether PackageManager can resolve ACTION_TETHER_SETTINGS (android.settings.TETHER_SETTINGS).
+   *  No extra permissions required. */
+  @PluginMethod
+  fun isHotspotSupported(call: PluginCall) {
+    val intent = Intent("android.settings.TETHER_SETTINGS")
+    val activities = context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+    val supported = activities.isNotEmpty()
+    android.util.Log.d("LanTransfer", "isHotspotSupported: $supported (${activities.size} activities found)")
+    call.resolve(JSObject().apply { put("supported", supported) })
+  }
+
+  /** Opens the system Hotspot / Tethering settings screen so the user can enable
+   *  the mobile Wi-Fi hotspot for Case 2 (phone-as-AP) transfers.
+   *  Uses android.settings.TETHER_SETTINGS (direct hotspot page) with fallback to
+   *  ACTION_WIRELESS_SETTINGS → ACTION_SETTINGS. */
+  @PluginMethod
+  fun openHotspotSettings(call: PluginCall) {
+    android.util.Log.d("LanTransfer", "openHotspotSettings called")
+    val act = activity ?: context
+    val intents = listOf(
+      "android.settings.TETHER_SETTINGS",
+      Settings.ACTION_WIRELESS_SETTINGS,
+      Settings.ACTION_SETTINGS
+    )
+    for (action in intents) {
+      try {
+        val intent = Intent(action).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        act.startActivity(intent)
+        android.util.Log.d("LanTransfer", "openHotspotSettings: launched $action")
+        call.resolve()
+        return
+      } catch (e: Exception) {
+        android.util.Log.w("LanTransfer", "openHotspotSettings: $action failed: ${e.message}")
+      }
+    }
+    call.reject("Unable to open hotspot settings")
   }
 
   /** TCP reachability probe (connect+close). Used by the sender to distinguish
