@@ -184,11 +184,15 @@ public class LanTransferPlugin: CAPPlugin {
       return
     }
     client.crypto = parseCrypto(call)
-    client.connect(host: host, port: port, sessionKey: call.getString("sessionKey"))
-    call.resolve(["connected": true, "role": "client", "remoteHost": host, "remotePort": port])
+    // Resolves only once the connection is ready (was: immediately, so a send
+    // that arrived first was silently dropped); rejects on refusal/timeout.
+    client.connect(host: host, port: port, sessionKey: call.getString("sessionKey")) { err in
+      if let err = err { call.reject("Connect failed: \(err.localizedDescription)", "CONNECT_FAILED") }
+      else { call.resolve(["connected": true, "role": "client", "remoteHost": host, "remotePort": port]) }
+    }
   }
 
-  @objc func disconnect(_ call: CAPPluginCall) { client.disconnect(); call.resolve() }
+  @objc func disconnect(_ call: CAPPluginCall) { client.disconnect { call.resolve() } }
 
   @objc func getConnectionInfo(_ call: CAPPluginCall) {
     call.resolve([
@@ -207,19 +211,22 @@ public class LanTransferPlugin: CAPPlugin {
 
   @objc func sendString(_ call: CAPPluginCall) {
     guard let text = call.getString("text") else { call.reject("text is required"); return }
-    do { try client.sendString(text); call.resolve() }
-    catch { call.reject("sendString failed: \(error)") }
+    client.sendString(text) { err in
+      if let err = err { call.reject("sendString failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
+    }
   }
 
   @objc func sendBase64(_ call: CAPPluginCall) {
     guard let base64 = call.getString("base64") else { call.reject("base64 is required"); return }
-    do { try client.sendBase64(base64); call.resolve() }
-    catch { call.reject("sendBase64 failed: \(error)") }
+    client.sendBase64(base64) { err in
+      if let err = err { call.reject("sendBase64 failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
+    }
   }
 
   @objc func sendFile(_ call: CAPPluginCall) {
     guard let path = call.getString("path") else { call.reject("path is required"); return }
-    client.sendFile(path: path)
-    call.resolve()
+    client.sendFile(path: path) { err in
+      if let err = err { call.reject("sendFile failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
+    }
   }
 }

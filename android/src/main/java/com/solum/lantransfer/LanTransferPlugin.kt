@@ -229,7 +229,9 @@ class LanTransferPlugin : Plugin() {
       server?.setSessionKey(sessionKey)
       server?.setReceiveMode(receiveMode, receiveFileName)
       server?.setCrypto(cryptoCfg)
-      server?.start(port)
+      try { server?.start(port) } catch (e: Exception) {
+        return call.reject("Server could not bind port $port: ${e.message ?: e}", "SERVER_BIND_FAILED")
+      }
 
       call.resolve(JSObject().apply {
         put("running", true)
@@ -272,7 +274,9 @@ class LanTransferPlugin : Plugin() {
     ensureServer()
     server?.setSessionKey(sessionKey)
     server?.setCrypto(cryptoCfg)
-    server?.start(port)
+    try { server?.start(port) } catch (e: Exception) {
+      return call.reject("Server could not bind port $port: ${e.message ?: e}", "SERVER_BIND_FAILED")
+    }
 
     call.resolve(JSObject().apply {
       put("running", true)
@@ -369,6 +373,16 @@ class LanTransferPlugin : Plugin() {
     try {
       client!!.sendFile(path) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
     } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
+  }
+
+  /** The Activity is going away (or being recreated): release port 8082 and the
+   *  client socket. Otherwise the old instance kept listening and the new one
+   *  could not bind, so payloads went to a server whose bridge was dead. */
+  override fun handleOnDestroy() {
+    try { server?.stop() } catch (_: Exception) {}
+    try { client?.disconnect() } catch (_: Exception) {}
+    try { discovery?.stopAdvertise(); discovery?.stopDiscovery() } catch (_: Exception) {}
+    super.handleOnDestroy()
   }
 
   private fun ensureServer() {

@@ -100,7 +100,7 @@ class LanTransferDiscovery(
       override fun onDiscoveryStopped(t: String) {}
       override fun onStartDiscoveryFailed(t: String, code: Int) {
         // Non-fatal: UDP probing still runs.
-        emit("error", JSObject().apply { put("code", "DISCOVERY_FAILED"); put("message", "NSD start failed: $code (UDP fallback still active)") })
+        emit("error", JSObject().apply { put("role", "discovery"); put("code", "DISCOVERY_FAILED"); put("message", "NSD start failed: $code (UDP fallback still active)") })
       }
       override fun onStopDiscoveryFailed(t: String, code: Int) {}
       override fun onServiceFound(s: NsdServiceInfo) { enqueueResolve(s) }
@@ -112,7 +112,7 @@ class LanTransferDiscovery(
     discListener = listener
     try { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener) }
     catch (e: Exception) {
-      emit("error", JSObject().apply { put("code", "DISCOVERY_FAILED"); put("message", "NSD discover threw: ${e.message} (UDP fallback still active)") })
+      emit("error", JSObject().apply { put("role", "discovery"); put("code", "DISCOVERY_FAILED"); put("message", "NSD discover threw: ${e.message} (UDP fallback still active)") })
     }
 
     startUdpProber()
@@ -293,7 +293,7 @@ class LanTransferDiscovery(
         }
       } catch (e: Exception) {
         if (udpProberRunning) {
-          emit("error", JSObject().apply { put("code", "UDP_PROBE_FAILED"); put("message", "UDP discovery probe failed: ${e.message}") })
+          emit("error", JSObject().apply { put("role", "discovery"); put("code", "UDP_PROBE_FAILED"); put("message", "UDP discovery probe failed: ${e.message}") })
         }
       } finally {
         try { sock?.close() } catch (_: Exception) {}

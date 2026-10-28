@@ -18,6 +18,7 @@ class LanTransferServer(
   private val emitEvent: (event: String, data:JSObject) -> Unit
 ) {
   private val executor = Executors.newCachedThreadPool()
+  private val handler = Executors.newSingleThreadExecutor()
   private var serverSocket: ServerSocket? = null
   // Every live connection. A new one must NOT close the previous: that reset a
   // payload still being read (truncated media, lost deploy acks).
@@ -37,29 +38,35 @@ class LanTransferServer(
   fun isRunning(): Boolean = running.get()
   fun getPort(): Int = serverSocket?.localPort ?: 0
 
+  /** Binds right here, so a failure (e.g. port 8082 still held by an old instance)
+   *  throws and the JS call rejects. It used to bind later on a worker thread:
+   *  startServer had already said "running", the failure was swallowed and the
+   *  display silently stopped receiving. Only the accept loop runs in the background. */
   fun start(port: Int) {
     if (running.get()) return
+    val ss = ServerSocket()
+    try {
+      // reuseAddress so a quick restart (or TIME_WAIT after idle) can re-bind the
+      // port immediately — avoids the server being un-connectable for ~60s.
+      ss.reuseAddress = true
+      ss.bind(java.net.InetSocketAddress(port))
+    } catch (e: Exception) {
+      ss.closeQuietly()
+      throw e
+    }
+    serverSocket = ss
     running.set(true)
+    emitStatus(
+      mapOf(
+        "role" to "server",
+        "status" to "server_started",
+        "ip" to NetUtils.getLocalIpv4Address(),
+        "port" to ss.localPort
+      )
+    )
 
     executor.execute {
-      var ss: ServerSocket? = null
       try {
-        // reuseAddress so a quick restart (or TIME_WAIT after idle) can re-bind the
-        // port immediately — avoids the server being un-connectable for ~60s.
-        ss = ServerSocket()
-        ss.reuseAddress = true
-        ss.bind(java.net.InetSocketAddress(port))
-        serverSocket = ss
-
-        emitStatus(
-                    mapOf(
-                        "role" to "server",
-                        "status" to "server_started",
-                        "ip" to NetUtils.getLocalIpv4Address(),
-                        "port" to ss.localPort
-                    )
-                )
-
         // One bad connection (a peer that reset before we set options, EMFILE, …)
         // must not end the loop: it used to fall through to stop() and the display
         // refused every later deploy until the app was restarted.
@@ -74,29 +81,31 @@ class LanTransferServer(
             socket.keepAlive = true
             socket.tcpNoDelay = true
             // A sender that vanished mid-payload (Wi-Fi drop) errors out instead of
-            // holding a thread and a half-written temp file forever.
+            // holding the handler and a half-written temp file forever.
             socket.soTimeout = 60_000
             // Large receive buffer → higher LAN throughput on big media transfers.
             try { socket.receiveBufferSize = 1 shl 20 } catch (_: Exception) {}
             sockets.add(socket)
 
             emitStatus(
-                          mapOf(
-                              "role" to "server",
-                              "status" to "connection_accepted",
-                              "remoteHost" to socket.inetAddress?.hostAddress,
-                              "remotePort" to socket.port
-                          )
-                      )
+              mapOf(
+                "role" to "server",
+                "status" to "connection_accepted",
+                "remoteHost" to socket.inetAddress?.hostAddress,
+                "remotePort" to socket.port
+              )
+            )
 
-            executor.execute { handleConnection(socket) }
+            // Accepted immediately (nothing is closed or left in the backlog), but
+            // HANDLED one at a time in accept order: receiveComplete must follow
+            // send order — the app pairs each 'mediaMeta' with the binary after it.
+            handler.execute { handleConnection(socket) }
           } catch (e: Exception) {
             sockets.remove(socket)
             socket.closeQuietly()
           }
         }
       } catch (e: Exception) {
-        // accept() throws when stop() closes the socket — that is not an error.
         if (running.get() && serverSocket === ss) emitError("SERVER_ERROR", "Server error: ${e.message ?: e}")
       } finally {
         // Only tear down if this loop still owns the server: after stop()+start()
@@ -120,12 +129,16 @@ class LanTransferServer(
   }
 
   private fun handleConnection(socket: Socket) {
+    var outFile: File? = null
+    var gotHello = false
+    var complete = false
     try {
       val input = BufferedInputStream(socket.getInputStream())
       val output = BufferedOutputStream(socket.getOutputStream())
 
       // HELLO
       val clientKey = LanTransferProtocol.readHello(input)
+      gotHello = true
       val expected = sessionKey
       if (!expected.isNullOrEmpty() && clientKey != expected) {
         emitError("BAD_SESSION_KEY", "Session key mismatch; closing connection.")
@@ -158,7 +171,8 @@ class LanTransferServer(
 
       val digest = MessageDigest.getInstance("SHA-256")
 
-      val (sink, outFile, memSink) = createReceiveSink(encoding)
+      val (sink, file, memSink) = createReceiveSink(encoding)
+      outFile = file
       sink.use { out ->
         if (!header.encrypted) {
           copyPlainWithProgressAndHash(input, out, totalPlain, digest)
@@ -225,10 +239,14 @@ class LanTransferServer(
         emitEvent("receiveComplete", js)
       }
 
+      complete = true
       output.flush()
     } catch (e: Exception) {
-      emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
+      // A reachability probe connects and closes without sending a byte — not an error.
+      if (gotHello) emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
     } finally {
+      // A failed transfer must not leave a multi-MB partial temp file behind.
+      if (!complete) outFile?.delete()
       socket.closeQuietly()
       sockets.remove(socket)
       emitStatus(mapOf(

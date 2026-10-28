@@ -10,7 +10,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.SecretKey
 
 class LanTransferClient(
@@ -18,6 +21,9 @@ class LanTransferClient(
   private val plugin: LanTransferPlugin
 ) {
   private val executor = Executors.newSingleThreadExecutor()
+  private val stallTimer = Executors.newSingleThreadScheduledExecutor()
+  /** A send with no bytes written for this long is aborted (see sendStream). */
+  internal var writeStallMs = 30_000L
   private var socket: Socket? = null
   private val connected = AtomicBoolean(false)
 
@@ -103,28 +109,39 @@ class LanTransferClient(
   // The send methods run on the client thread and call [done] once the bytes are
   // flushed (or failed), so the JS promise means "sent", not merely "queued".
   fun sendString(text: String, done: (Exception?) -> Unit) {
-    val bytes = text.toByteArray(Charsets.UTF_8)
-    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_UTF8, done)
+    sendStream({ val b = text.toByteArray(Charsets.UTF_8); ByteArrayInputStream(b) to b.size.toLong() },
+      LanTransferProtocol.ENCODING_UTF8, done)
   }
 
   fun sendBase64(base64: String, done: (Exception?) -> Unit) {
-    val bytes = Base64.decode(base64, Base64.DEFAULT)
-    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_BINARY, done)
+    sendStream({ val b = Base64.decode(base64, Base64.DEFAULT); ByteArrayInputStream(b) to b.size.toLong() },
+      LanTransferProtocol.ENCODING_BINARY, done)
   }
 
   fun sendFile(pathOrUri: String, done: (Exception?) -> Unit) {
-    val (stream, total) = openStreamAndSize(pathOrUri)
-    sendStream(BufferedInputStream(stream), total, LanTransferProtocol.ENCODING_BINARY, done)
+    sendStream({ val (stream, total) = openStreamAndSize(pathOrUri); BufferedInputStream(stream) to total },
+      LanTransferProtocol.ENCODING_BINARY, done)
   }
 
-  private fun sendStream(input: InputStream, totalPlain: Long, encoding: Byte, done: (Exception?) -> Unit) {
+  private fun sendStream(open: () -> Pair<InputStream, Long>, encoding: Byte, done: (Exception?) -> Unit) {
     val cfg = crypto
 
     executor.execute {
-      input.use { ins ->
-        try {
+      var watchdog: ScheduledFuture<*>? = null
+      try {
+        // Decode/open HERE, on the client thread: decoding a multi-MB video on
+        // Capacitor's shared plugin thread stalled every plugin (and could OOM).
+        val (input, totalPlain) = open()
+        input.use { ins ->
           // Read the socket HERE: a connect() queued just before has now run.
           val s = socket ?: throw IllegalStateException("Not connected")
+          // write() has no timeout: a peer that lost power/Wi-Fi mid-send blocked it
+          // for ~15 min and wedged every later connect/send queued on this thread.
+          // Closing the socket after writeStallMs without progress makes it throw.
+          val lastWrite = AtomicLong(System.currentTimeMillis())
+          watchdog = stallTimer.scheduleAtFixedRate({
+            if (System.currentTimeMillis() - lastWrite.get() > writeStallMs) { try { s.close() } catch (_: Exception) {} }
+          }, 1, 1, TimeUnit.SECONDS)
           val out = BufferedOutputStream(s.getOutputStream())
           val encrypted = (cfg?.enabled == true)
           val chunkSize = cfg?.chunkSize ?: 65_536
@@ -165,6 +182,7 @@ class LanTransferClient(
 
               digest.update(buffer, 0, read)
               out.write(buffer, 0, read)
+              lastWrite.set(System.currentTimeMillis())
 
               plainSent += read.toLong()
               // Throttle progress: emit at most every ~1 MB (or at the end).
@@ -198,6 +216,7 @@ class LanTransferClient(
             val nonce = LanTransferCrypto.nonce12(headerMat.baseNonce8, counter)
             val (ct, tag) = LanTransferCrypto.encryptChunk(key, nonce, buffer, read)
             LanTransferProtocol.writeEncryptedChunk(out, read, ct, tag)
+            lastWrite.set(System.currentTimeMillis())
 
             plainSent += read.toLong()
             counter += 1
@@ -207,14 +226,16 @@ class LanTransferClient(
           out.flush()
           emitSendComplete(totalPlain, encodingStr, true, HashUtils.toHex(digest.digest()))
           done(null)
-        } catch (e: Exception) {
-          plugin.emit("error", JSObject().apply {
-            put("role", "client")
-            put("code", "SEND_FAILED")
-            put("message", e.message ?: e.toString())
-          })
-          done(e)
         }
+      } catch (t: Throwable) { // incl. OutOfMemoryError on a huge video: fail the send, don't crash
+        plugin.emit("error", JSObject().apply {
+          put("role", "client")
+          put("code", "SEND_FAILED")
+          put("message", t.message ?: t.toString())
+        })
+        done(t as? Exception ?: Exception(t.toString(), t))
+      } finally {
+        watchdog?.cancel(false)
       }
     }
   }

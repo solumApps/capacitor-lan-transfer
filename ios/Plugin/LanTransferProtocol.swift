@@ -92,17 +92,17 @@ enum LanTransferProtocol {
 private extension Data {
   mutating func appendUInt16(_ value: UInt16) {
     var v = value.bigEndian
-    withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+    Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
   }
 
   mutating func appendInt32(_ value: Int32) {
     var v = value.bigEndian
-    withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+    Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
   }
 
   mutating func appendInt64(_ value: Int64) {
     var v = value.bigEndian
-    withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+    Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
   }
 
   func readUInt16(at offset: Int) -> UInt16 {

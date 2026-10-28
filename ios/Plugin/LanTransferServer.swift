@@ -22,8 +22,17 @@ final class LanTransferServer {
   var onReceiveComplete: (([String: Any]) -> Void)?
   var onError: (([String: Any]) -> Void)?
 
+  private var fileSeq = 0
+
+  /// start/stop run on `queue`, where every connection and listener callback also
+  /// runs — they used to mutate the same state from the plugin's thread.
   func start(port desiredPort: Int) throws {
-    if running { return }
+    try queue.sync { try startOnQueue(port: desiredPort) }
+  }
+
+  private func startOnQueue(port desiredPort: Int) throws {
+    // `running` only turns true on .ready, so it can't guard a second start().
+    if listener != nil { return }
 
     let params = NWParameters.tcp
     let nwPort: NWEndpoint.Port = (desiredPort == 0)
@@ -33,8 +42,10 @@ final class LanTransferServer {
     let listener = try NWListener(using: params, on: nwPort)
     self.listener = listener
 
-    listener.stateUpdateHandler = { [weak self] state in
-      guard let self = self else { return }
+    listener.stateUpdateHandler = { [weak self, weak listener] state in
+      // A stopped listener's late .cancelled must not reset the state of the
+      // NEW one (it let a later start() open a second listener).
+      guard let self = self, let listener = listener, self.listener === listener else { return }
       switch state {
       case .ready:
         self.running = true
@@ -76,12 +87,15 @@ final class LanTransferServer {
   }
 
   func stop() {
-    connections.values.forEach { $0.cancel() }
-    connections.removeAll()
-    listener?.cancel()
-    listener = nil
-    running = false
-    port = 0
+    queue.sync {
+      connections.values.forEach { $0.cancel() }
+      connections.removeAll()
+      listener?.cancel()
+      listener = nil
+      running = false
+      port = 0
+      onStatus?(["role": "server", "status": "server_stopped"])
+    }
   }
 
   private func handleConnection(_ conn: NWConnection) {
@@ -164,7 +178,7 @@ final class LanTransferServer {
       let ext = (header.encoding == LanTransferProtocol.encodingUtf8) ? "txt" : "bin"
       let name = (receiveFileName?.isEmpty == false)
         ? receiveFileName!
-        : "lantransfer_\(Int(Date().timeIntervalSince1970)).\(ext)"
+        : "lantransfer_\(Int(Date().timeIntervalSince1970 * 1000))_\(nextFileSeq()).\(ext)"
       let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
       let url = dir.appendingPathComponent(name)
       FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -185,6 +199,7 @@ final class LanTransferServer {
 
     func finish() {
       try? fileHandle?.close()
+      defer { conn.cancel() }   // done with this connection (acks used to linger until stopServer)
       let encodingStr = (header.encoding == LanTransferProtocol.encodingUtf8) ? "utf8" : "binary"
       let digest = hasher.finalize()
       let hex = digest.map { String(format: "%02x", $0) }.joined()
@@ -220,6 +235,7 @@ final class LanTransferServer {
 
     // Plain mode: read totalPlain bytes
     if !header.encrypted {
+      if totalPlain == 0 { finish(); return }   // nothing to read: complete now (used to hang)
       readStreamPlain(conn, totalBytes: totalPlain) { chunk in
         hasher.update(data: chunk)
         receivedPlain += Int64(chunk.count)
@@ -331,6 +347,8 @@ final class LanTransferServer {
 
     step()
   }
+
+  private func nextFileSeq() -> Int { fileSeq += 1; return fileSeq }
 
   private func fail(_ message: String, _ conn: NWConnection) {
     onError?(["role":"server","message":message,"code":"SERVER_ERROR"])
