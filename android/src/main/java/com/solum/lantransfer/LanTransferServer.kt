@@ -7,8 +7,10 @@ import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class LanTransferServer(
   private val context: Context,
@@ -16,7 +18,10 @@ class LanTransferServer(
 ) {
   private val executor = Executors.newCachedThreadPool()
   private var serverSocket: ServerSocket? = null
-  private var activeSocket: Socket? = null
+  // Every live connection. A new one must NOT close the previous: that reset a
+  // payload still being read (truncated media, lost deploy acks).
+  private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+  private val fileSeq = AtomicLong()
   private val running = AtomicBoolean(false)
 
   @Volatile private var sessionKey: String? = null
@@ -36,10 +41,11 @@ class LanTransferServer(
     running.set(true)
 
     executor.execute {
+      var ss: ServerSocket? = null
       try {
         // reuseAddress so a quick restart (or TIME_WAIT after idle) can re-bind the
         // port immediately — avoids the server being un-connectable for ~60s.
-        val ss = ServerSocket()
+        ss = ServerSocket()
         ss.reuseAddress = true
         ss.bind(java.net.InetSocketAddress(port))
         serverSocket = ss
@@ -57,10 +63,12 @@ class LanTransferServer(
           val socket = ss.accept()
           socket.keepAlive = true
           socket.tcpNoDelay = true
+          // A sender that vanished mid-payload (Wi-Fi drop) errors out instead of
+          // holding a thread and a half-written temp file forever.
+          socket.soTimeout = 60_000
           // Large receive buffer → higher LAN throughput on big media transfers.
           try { socket.receiveBufferSize = 1 shl 20 } catch (_: Exception) {}
-          activeSocket?.closeQuietly()
-          activeSocket = socket
+          sockets.add(socket)
 
           emitStatus(
                         mapOf(
@@ -74,17 +82,20 @@ class LanTransferServer(
           executor.execute { handleConnection(socket) }
         }
       } catch (e: Exception) {
-        emitError("SERVER_ERROR", "Server error: ${e.message ?: e}")
+        // accept() throws when stop() closes the socket — that is not an error.
+        if (running.get() && serverSocket === ss) emitError("SERVER_ERROR", "Server error: ${e.message ?: e}")
       } finally {
-        stop()
+        // Only tear down if this loop still owns the server: after stop()+start()
+        // the old loop's late finally used to close the NEW server socket.
+        if (serverSocket === ss) stop()
       }
     }
   }
 
   fun stop() {
     running.set(false)
-    activeSocket?.closeQuietly()
-    activeSocket = null
+    sockets.forEach { it.closeQuietly() }
+    sockets.clear()
     serverSocket?.closeQuietly()
     serverSocket = null
 
@@ -205,6 +216,7 @@ class LanTransferServer(
       emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
     } finally {
       socket.closeQuietly()
+      sockets.remove(socket)
       emitStatus(mapOf(
           "role" to "server",
           "status" to "connection_closed"
@@ -229,7 +241,7 @@ class LanTransferServer(
       return Triple(baos, null, baos)
     }
     val ext = if (encoding == LanTransferProtocol.ENCODING_UTF8) "txt" else "bin"
-    val name = receiveFileName?.takeIf { it.isNotBlank() } ?: "lantransfer_${System.currentTimeMillis()}.$ext"
+    val name = receiveFileName?.takeIf { it.isNotBlank() } ?: "lantransfer_${System.currentTimeMillis()}_${fileSeq.incrementAndGet()}.$ext"
     val file = File(context.filesDir, name)
     file.parentFile?.mkdirs()
     return Triple(BufferedOutputStream(FileOutputStream(file)), file, null)

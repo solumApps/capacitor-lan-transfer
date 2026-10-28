@@ -26,6 +26,15 @@ class LanTransferClient(
 
   fun isConnected(): Boolean = connected.get()
 
+  /** Run [work] on the client thread, after any queued connect/send, and report
+   *  the outcome. Keeps connect() off Capacitor's plugin thread — it is shared by
+   *  every plugin, and a 2 x 7 s connect timeout there froze all Filesystem calls. */
+  fun enqueue(work: () -> Unit, done: (Exception?) -> Unit) {
+    executor.execute {
+      try { work(); done(null) } catch (e: Exception) { done(e) }
+    }
+  }
+
   /**
    * Connects synchronously (runs on Capacitor's background thread). Resolves the
    * plugin call only after the socket is truly connected — fixes the "first attempt
@@ -88,29 +97,32 @@ class LanTransferClient(
     })
   }
 
-  fun sendString(text: String) {
+  // The send methods run on the client thread and call [done] once the bytes are
+  // flushed (or failed), so the JS promise means "sent", not merely "queued".
+  fun sendString(text: String, done: (Exception?) -> Unit) {
     val bytes = text.toByteArray(Charsets.UTF_8)
-    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_UTF8)
+    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_UTF8, done)
   }
 
-  fun sendBase64(base64: String) {
+  fun sendBase64(base64: String, done: (Exception?) -> Unit) {
     val bytes = Base64.decode(base64, Base64.DEFAULT)
-    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_BINARY)
+    sendStream(ByteArrayInputStream(bytes), bytes.size.toLong(), LanTransferProtocol.ENCODING_BINARY, done)
   }
 
-  fun sendFile(pathOrUri: String) {
+  fun sendFile(pathOrUri: String, done: (Exception?) -> Unit) {
     val (stream, total) = openStreamAndSize(pathOrUri)
-    sendStream(BufferedInputStream(stream), total, LanTransferProtocol.ENCODING_BINARY)
+    sendStream(BufferedInputStream(stream), total, LanTransferProtocol.ENCODING_BINARY, done)
   }
 
-  private fun sendStream(input: InputStream, totalPlain: Long, encoding: Byte) {
-    val s = socket ?: throw IllegalStateException("Not connected")
-    val out = BufferedOutputStream(s.getOutputStream())
+  private fun sendStream(input: InputStream, totalPlain: Long, encoding: Byte, done: (Exception?) -> Unit) {
     val cfg = crypto
 
     executor.execute {
       input.use { ins ->
         try {
+          // Read the socket HERE: a connect() queued just before has now run.
+          val s = socket ?: throw IllegalStateException("Not connected")
+          val out = BufferedOutputStream(s.getOutputStream())
           val encrypted = (cfg?.enabled == true)
           val chunkSize = cfg?.chunkSize ?: 65_536
           val iters = cfg?.iterations ?: 100_000
@@ -161,6 +173,7 @@ class LanTransferClient(
 
             out.flush()
             emitSendComplete(totalPlain, encodingStr, false, HashUtils.toHex(digest.digest()))
+            done(null)
             return@use
           }
 
@@ -190,12 +203,14 @@ class LanTransferClient(
 
           out.flush()
           emitSendComplete(totalPlain, encodingStr, true, HashUtils.toHex(digest.digest()))
+          done(null)
         } catch (e: Exception) {
           plugin.emit("error", JSObject().apply {
             put("role", "client")
             put("code", "SEND_FAILED")
             put("message", e.message ?: e.toString())
           })
+          done(e)
         }
       }
     }

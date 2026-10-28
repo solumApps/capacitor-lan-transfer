@@ -5,7 +5,9 @@ import CryptoKit
 final class LanTransferServer {
   private let queue = DispatchQueue(label: "LanTransferServerQueue")
   private var listener: NWListener?
-  private var connection: NWConnection?
+  // Every live connection. A new one must NOT cancel the previous: that cut off
+  // payloads still being read (truncated media, lost deploy acks).
+  private var connections: [ObjectIdentifier: NWConnection] = [:]
 
   private(set) var running: Bool = false
   private(set) var port: UInt16 = 0
@@ -56,8 +58,14 @@ final class LanTransferServer {
 
     listener.newConnectionHandler = { [weak self] conn in
       guard let self = self else { return }
-      self.connection?.cancel()
-      self.connection = conn
+      let id = ObjectIdentifier(conn)
+      self.connections[id] = conn
+      conn.stateUpdateHandler = { [weak self] state in
+        switch state {
+        case .cancelled, .failed: self?.queue.async { self?.connections[id] = nil }
+        default: break
+        }
+      }
 
       self.onStatus?(["role":"server","status":"connection_accepted"])
       conn.start(queue: self.queue)
@@ -68,8 +76,8 @@ final class LanTransferServer {
   }
 
   func stop() {
-    connection?.cancel()
-    connection = nil
+    connections.values.forEach { $0.cancel() }
+    connections.removeAll()
     listener?.cancel()
     listener = nil
     running = false
@@ -81,12 +89,12 @@ final class LanTransferServer {
     readExactly(conn, count: 7) { [weak self] res in
       guard let self = self else { return }
       switch res {
-      case .failure(let err): self.fail("HELLO read failed: \(err)")
+      case .failure(let err): self.fail("HELLO read failed: \(err)", conn)
       case .success(let prefix):
         let keyLen = Int(prefix.readUInt16(at: 5))
         self.readExactly(conn, count: keyLen) { res2 in
           switch res2 {
-          case .failure(let err2): self.fail("HELLO key read failed: \(err2)")
+          case .failure(let err2): self.fail("HELLO key read failed: \(err2)", conn)
           case .success(let keyData):
             do {
               let key = try LanTransferProtocol.parseHello(prefix7: prefix, keyData: keyData)
@@ -97,7 +105,7 @@ final class LanTransferServer {
               }
               self.readDataHeader(conn)
             } catch {
-              self.fail("Bad HELLO frame")
+              self.fail("Bad HELLO frame", conn)
             }
           }
         }
@@ -110,7 +118,7 @@ final class LanTransferServer {
     readExactly(conn, count: 43) { [weak self] res in
       guard let self = self else { return }
       switch res {
-      case .failure(let err): self.fail("DATA header read failed: \(err)")
+      case .failure(let err): self.fail("DATA header read failed: \(err)", conn)
       case .success(let hdrData):
         do {
           let hdr = try LanTransferProtocol.parseDataHeaderV2(hdrData)
@@ -136,7 +144,7 @@ final class LanTransferServer {
 
           self.receivePayload(conn, header: hdr)
         } catch {
-          self.fail("Bad DATA header")
+          self.fail("Bad DATA header", conn)
         }
       }
     }
@@ -241,11 +249,11 @@ final class LanTransferServer {
         readExactly(conn, count: 4) { [weak self] resLen in
           guard let self = self else { return }
           switch resLen {
-          case .failure(let err): self.fail("Encrypted chunkLen read failed: \(err)")
+          case .failure(let err): self.fail("Encrypted chunkLen read failed: \(err)", conn)
           case .success(let lenData):
             let chunkLen = Int(lenData.readUInt32(at: 0))
             if chunkLen <= 0 || chunkLen > Int(header.chunkSize) {
-              self.fail("Bad chunkLen \(chunkLen)")
+              self.fail("Bad chunkLen \(chunkLen)", conn)
               return
             }
 
@@ -253,7 +261,7 @@ final class LanTransferServer {
             self.readExactly(conn, count: chunkLen + 16) { resChunk in
               switch resChunk {
               case .failure(let err2):
-                self.fail("Encrypted chunk read failed: \(err2)")
+                self.fail("Encrypted chunk read failed: \(err2)", conn)
               case .success(let blob):
                 let ct = blob.subdata(in: 0..<chunkLen)
                 let tag = blob.subdata(in: chunkLen..<(chunkLen+16))
@@ -271,7 +279,7 @@ final class LanTransferServer {
 
                   loop()
                 } catch {
-                  self.fail("Decrypt failed: \(error)")
+                  self.fail("Decrypt failed: \(error)", conn)
                 }
               }
             }
@@ -292,8 +300,8 @@ final class LanTransferServer {
       if remaining <= 0 { return }
       let maxLen = min(64 * 1024, Int(remaining))
       conn.receive(minimumIncompleteLength: 1, maximumLength: maxLen) { data, _, isComplete, error in
-        if let error = error { self.fail("Receive failed: \(error)"); return }
-        if isComplete && (data == nil || data!.isEmpty) { self.fail("Unexpected end of stream"); return }
+        if let error = error { self.fail("Receive failed: \(error)", conn); return }
+        if isComplete && (data == nil || data!.isEmpty) { self.fail("Unexpected end of stream", conn); return }
         let chunk = data ?? Data()
         remaining -= Int64(chunk.count)
         onChunk(chunk)
@@ -324,9 +332,9 @@ final class LanTransferServer {
     step()
   }
 
-  private func fail(_ message: String) {
+  private func fail(_ message: String, _ conn: NWConnection) {
     onError?(["role":"server","message":message,"code":"SERVER_ERROR"])
-    connection?.cancel()
+    conn.cancel()
   }
 }
 

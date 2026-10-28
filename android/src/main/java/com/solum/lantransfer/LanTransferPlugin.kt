@@ -309,26 +309,24 @@ class LanTransferPlugin : Plugin() {
     }
 
     ensureClient()
-    client?.setCrypto(cryptoCfg)
-    try {
-      client?.connect(host, port, sessionKey)  // blocking; throws on failure
-    } catch (e: Exception) {
-      call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
-      return
+    val c = client!!
+    c.setCrypto(cryptoCfg)
+    c.enqueue({ c.connect(host, port, sessionKey) }) { e ->
+      if (e != null) call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
+      else call.resolve(JSObject().apply {
+        put("connected", true)
+        put("role", "client")
+        put("remoteHost", host)
+        put("remotePort", port)
+      })
     }
-
-    call.resolve(JSObject().apply {
-      put("connected", true)
-      put("role", "client")
-      put("remoteHost", host)
-      put("remotePort", port)
-    })
   }
 
   @PluginMethod
   fun disconnect(call: PluginCall) {
-    client?.disconnect()
-    call.resolve()
+    val c = client ?: return call.resolve()
+    // Queued behind pending sends, so it can't cut one off mid-write.
+    c.enqueue({ c.disconnect() }) { call.resolve() }
   }
 
   @PluginMethod
@@ -350,24 +348,27 @@ class LanTransferPlugin : Plugin() {
   fun sendString(call: PluginCall) {
     val text = call.getString("text") ?: return call.reject("text is required")
     ensureClient()
-    client?.sendString(text)
-    call.resolve()
+    try {
+      client!!.sendString(text) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+    } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
   @PluginMethod
   fun sendBase64(call: PluginCall) {
     val base64 = call.getString("base64") ?: return call.reject("base64 is required")
     ensureClient()
-    client?.sendBase64(base64)
-    call.resolve()
+    try {
+      client!!.sendBase64(base64) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+    } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
   @PluginMethod
   fun sendFile(call: PluginCall) {
     val path = call.getString("path") ?: return call.reject("path is required")
     ensureClient()
-    client?.sendFile(path)
-    call.resolve()
+    try {
+      client!!.sendFile(path) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+    } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
   private fun ensureServer() {
