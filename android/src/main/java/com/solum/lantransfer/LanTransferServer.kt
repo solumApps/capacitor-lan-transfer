@@ -7,6 +7,7 @@ import java.io.*
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -20,7 +21,7 @@ class LanTransferServer(
   private var serverSocket: ServerSocket? = null
   // Every live connection. A new one must NOT close the previous: that reset a
   // payload still being read (truncated media, lost deploy acks).
-  private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+  private val sockets: MutableSet<Socket> = Collections.newSetFromMap(ConcurrentHashMap()) // newKeySet() needs API 24
   private val fileSeq = AtomicLong()
   private val running = AtomicBoolean(false)
 
@@ -59,27 +60,40 @@ class LanTransferServer(
                     )
                 )
 
-        while (running.get()) {
-          val socket = ss.accept()
-          socket.keepAlive = true
-          socket.tcpNoDelay = true
-          // A sender that vanished mid-payload (Wi-Fi drop) errors out instead of
-          // holding a thread and a half-written temp file forever.
-          socket.soTimeout = 60_000
-          // Large receive buffer → higher LAN throughput on big media transfers.
-          try { socket.receiveBufferSize = 1 shl 20 } catch (_: Exception) {}
-          sockets.add(socket)
+        // One bad connection (a peer that reset before we set options, EMFILE, …)
+        // must not end the loop: it used to fall through to stop() and the display
+        // refused every later deploy until the app was restarted.
+        while (running.get() && !ss.isClosed) {
+          val socket = try { ss.accept() } catch (e: Exception) {
+            if (!running.get() || ss.isClosed) break
+            emitError("ACCEPT_FAILED", "Accept failed (server keeps running): ${e.message ?: e}")
+            Thread.sleep(250)
+            continue
+          }
+          try {
+            socket.keepAlive = true
+            socket.tcpNoDelay = true
+            // A sender that vanished mid-payload (Wi-Fi drop) errors out instead of
+            // holding a thread and a half-written temp file forever.
+            socket.soTimeout = 60_000
+            // Large receive buffer → higher LAN throughput on big media transfers.
+            try { socket.receiveBufferSize = 1 shl 20 } catch (_: Exception) {}
+            sockets.add(socket)
 
-          emitStatus(
-                        mapOf(
-                            "role" to "server",
-                            "status" to "connection_accepted",
-                            "remoteHost" to socket.inetAddress.hostAddress,
-                            "remotePort" to socket.port
-                        )
-                    )
+            emitStatus(
+                          mapOf(
+                              "role" to "server",
+                              "status" to "connection_accepted",
+                              "remoteHost" to socket.inetAddress?.hostAddress,
+                              "remotePort" to socket.port
+                          )
+                      )
 
-          executor.execute { handleConnection(socket) }
+            executor.execute { handleConnection(socket) }
+          } catch (e: Exception) {
+            sockets.remove(socket)
+            socket.closeQuietly()
+          }
         }
       } catch (e: Exception) {
         // accept() throws when stop() closes the socket — that is not an error.

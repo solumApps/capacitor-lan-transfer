@@ -48,8 +48,8 @@ class LanTransferClient(
     var attempt = 0
     while (attempt < 2) {
       attempt++
+      val s = Socket()
       try {
-        val s = Socket()
         s.tcpNoDelay = true
         s.keepAlive = true
         // Large send buffer → higher LAN throughput on big media transfers.
@@ -72,7 +72,10 @@ class LanTransferClient(
       } catch (e: Exception) {
         lastErr = e
         connected.set(false)
-        try { socket?.close() } catch (_: Exception) {}
+        // Close the socket that FAILED — this used to close the (null) field and
+        // leak 2 fds per refused connect; on the LCD's 1024-fd limit that ended in
+        // accept() failing with EMFILE and the receiver shutting down.
+        try { s.close() } catch (_: Exception) {}
         socket = null
         if (attempt < 2) { try { Thread.sleep(300) } catch (_: InterruptedException) {} }
       }
