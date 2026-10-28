@@ -17,6 +17,12 @@ object LanTransferProtocol {
 
   const val FLAG_ENCRYPTED: Byte = 0x01
 
+  /** Receiver → sender after each payload: ACK = written + receiveComplete emitted,
+   *  the connection stays open for the next DATA frame; NAK = rejected/failed. An
+   *  older receiver sends neither and closes the connection after one payload. */
+  const val ACK: Byte = 0x06
+  const val NAK: Byte = 0x15
+
   data class DataHeader(
     val encoding: Byte,
     val flags: Byte,

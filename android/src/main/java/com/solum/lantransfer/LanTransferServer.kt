@@ -128,25 +128,63 @@ class LanTransferServer(
         ))
   }
 
+  /** Runs on the handler thread: HELLO, then the first payload. Later payloads on
+   *  the same connection go through [awaitNext]. */
   private fun handleConnection(socket: Socket) {
-    var outFile: File? = null
-    var gotHello = false
-    var complete = false
+    val input: PushbackInputStream
+    val output: BufferedOutputStream
     try {
-      val input = BufferedInputStream(socket.getInputStream())
-      val output = BufferedOutputStream(socket.getOutputStream())
-
-      // HELLO
+      input = PushbackInputStream(BufferedInputStream(socket.getInputStream()), 1)
+      output = BufferedOutputStream(socket.getOutputStream())
       val clientKey = LanTransferProtocol.readHello(input)
-      gotHello = true
       val expected = sessionKey
       if (!expected.isNullOrEmpty() && clientKey != expected) {
         emitError("BAD_SESSION_KEY", "Session key mismatch; closing connection.")
-        socket.closeQuietly()
+        nak(output)
+        closeConnection(socket)
         return
       }
+    } catch (e: Exception) {
+      // A reachability probe connects and closes without sending a byte — not an error.
+      closeConnection(socket)
+      return
+    }
+    if (receivePayload(input, output)) awaitNext(socket, input, output) else closeConnection(socket)
+  }
 
-      // DATA header
+  /** Between payloads a connection waits on its own thread, so an idle sender never
+   *  holds the handler; its next payload is queued on the handler in arrival order.
+   *  EOF, a reset or the 60 s idle timeout here is a normal end of the connection. */
+  private fun awaitNext(socket: Socket, input: PushbackInputStream, output: OutputStream) {
+    try {
+      executor.execute {
+        val next = try { input.read() } catch (_: Exception) { -1 }
+        if (next < 0 || !running.get()) { closeConnection(socket); return@execute }
+        input.unread(next)
+        try {
+          handler.execute {
+            if (receivePayload(input, output)) awaitNext(socket, input, output) else closeConnection(socket)
+          }
+        } catch (_: Exception) { closeConnection(socket) }
+      }
+    } catch (_: Exception) { closeConnection(socket) }
+  }
+
+  private fun closeConnection(socket: Socket) {
+    socket.closeQuietly()
+    if (sockets.remove(socket)) emitStatus(mapOf("role" to "server", "status" to "connection_closed"))
+  }
+
+  private fun nak(output: OutputStream) {
+    try { output.write(LanTransferProtocol.NAK.toInt()); output.flush() } catch (_: Exception) {}
+  }
+
+  /** One DATA frame: header, payload, receiveComplete, then the delivery ACK the
+   *  sender waits for. Returns false (after a NAK) when the connection must close. */
+  private fun receivePayload(input: InputStream, output: OutputStream): Boolean {
+    var outFile: File? = null
+    var complete = false
+    try {
       val header = LanTransferProtocol.readDataHeaderV2(input)
       val totalPlain = header.totalPlainBytes
       val encoding = header.encoding
@@ -165,8 +203,14 @@ class LanTransferServer(
       val cfg = crypto
       if (cfg?.requireEncryption == true && !header.encrypted) {
         emitError("ENCRYPTION_REQUIRED", "Server requires encryption but received unencrypted payload.")
-        socket.closeQuietly()
-        return
+        nak(output)
+        return false
+      }
+      val pass = if (header.encrypted) cfg?.passphrase else null
+      if (header.encrypted && pass == null) {
+        emitError("NO_PASSPHRASE", "Encrypted payload received but server passphrase not set.")
+        nak(output)
+        return false
       }
 
       val digest = MessageDigest.getInstance("SHA-256")
@@ -177,16 +221,13 @@ class LanTransferServer(
         if (!header.encrypted) {
           copyPlainWithProgressAndHash(input, out, totalPlain, digest)
         } else {
-          val pass = cfg?.passphrase ?: run {
-            emitError("NO_PASSPHRASE", "Encrypted payload received but server passphrase not set.")
-            return
-          }
-          val key = LanTransferCrypto.deriveKey(pass, header.salt16, cfg.iterations)
+          val key = LanTransferCrypto.deriveKey(pass!!, header.salt16, cfg!!.iterations)
 
           val chunkCipherBuf = ByteArray(header.chunkSize)
           val tagBuf = ByteArray(16)
           var counter = 0
           var plainReceived = 0L
+          var lastEmitAt = 0L
 
           while (plainReceived < totalPlain) {
             val chunkLen = LanTransferProtocol.readEncryptedChunkHeader(input)
@@ -208,7 +249,10 @@ class LanTransferServer(
             plainReceived += plain.size.toLong()
             counter += 1
 
-            emitReceiveProgress(plainReceived, totalPlain)
+            val now = System.currentTimeMillis()
+            if (now - lastEmitAt >= PROGRESS_INTERVAL_MS || plainReceived >= totalPlain) {
+              emitReceiveProgress(plainReceived, totalPlain); lastEmitAt = now
+            }
           }
         }
       }
@@ -240,19 +284,17 @@ class LanTransferServer(
       }
 
       complete = true
-      output.flush()
+      // The sender resolves its send on this byte and reuses the connection. An
+      // older sender never reads it, which is harmless.
+      try { output.write(LanTransferProtocol.ACK.toInt()); output.flush() } catch (_: Exception) {}
+      return true
     } catch (e: Exception) {
-      // A reachability probe connects and closes without sending a byte — not an error.
-      if (gotHello) emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
+      emitError("CONNECTION_ERROR", "Connection error: ${e.message ?: e}")
+      nak(output)
+      return false
     } finally {
       // A failed transfer must not leave a multi-MB partial temp file behind.
       if (!complete) outFile?.delete()
-      socket.closeQuietly()
-      sockets.remove(socket)
-      emitStatus(mapOf(
-          "role" to "server",
-          "status" to "connection_closed"
-      ))
     }
   }
 
@@ -288,7 +330,7 @@ class LanTransferServer(
     // 256 KB buffer (was 64 KB) → fewer iterations / syscalls.
     val buffer = ByteArray(256 * 1024)
     var transferred = 0L
-    var lastEmit = 0L
+    var lastEmitAt = 0L
 
     while (transferred < totalBytes) {
       val remaining = totalBytes - transferred
@@ -300,10 +342,11 @@ class LanTransferServer(
       output.write(buffer, 0, read)
       transferred += read.toLong()
 
-      // Throttle progress: at most every ~1 MB (or at the end). Per-64KB emits
-      // flood the Capacitor bridge — costly on the memory-constrained LCD.
-      if (transferred - lastEmit >= 1_048_576L || transferred >= totalBytes) {
-        emitReceiveProgress(transferred, totalBytes); lastEmit = transferred
+      // Throttle progress by time (not every 1 MB): a slow link still shows movement
+      // several times a second, a fast one doesn't flood the Capacitor bridge.
+      val now = System.currentTimeMillis()
+      if (now - lastEmitAt >= PROGRESS_INTERVAL_MS || transferred >= totalBytes) {
+        emitReceiveProgress(transferred, totalBytes); lastEmitAt = now
       }
     }
     output.flush()
@@ -324,4 +367,6 @@ class LanTransferServer(
   }
 
   private fun Closeable.closeQuietly() { try { close() } catch (_: Exception) {} }
+
+  companion object { const val PROGRESS_INTERVAL_MS = 200L }
 }

@@ -117,7 +117,7 @@ final class LanTransferServer {
                 conn.cancel()
                 return
               }
-              self.readDataHeader(conn)
+              self.readDataHeader(conn, afterPayload: false)
             } catch {
               self.fail("Bad HELLO frame", conn)
             }
@@ -127,12 +127,22 @@ final class LanTransferServer {
     }
   }
 
-  private func readDataHeader(_ conn: NWConnection) {
+  /// The connection stays open after each payload for the next DATA frame. Between
+  /// payloads, EOF is a normal close and 60 s without a new frame ends it.
+  private func readDataHeader(_ conn: NWConnection, afterPayload: Bool) {
+    var idle: DispatchWorkItem?
+    if afterPayload {
+      let w = DispatchWorkItem { conn.cancel() }
+      idle = w
+      queue.asyncAfter(deadline: .now() + 60, execute: w)
+    }
     // v2 header is 43 bytes
     readExactly(conn, count: 43) { [weak self] res in
+      idle?.cancel()
       guard let self = self else { return }
       switch res {
-      case .failure(let err): self.fail("DATA header read failed: \(err)", conn)
+      case .failure(let err):
+        if afterPayload { conn.cancel() } else { self.fail("DATA header read failed: \(err)", conn) }
       case .success(let hdrData):
         do {
           let hdr = try LanTransferProtocol.parseDataHeaderV2(hdrData)
@@ -143,7 +153,7 @@ final class LanTransferServer {
               "message": "Server requires encryption but received unencrypted payload.",
               "code": "ENCRYPTION_REQUIRED"
             ])
-            conn.cancel()
+            self.nakAndClose(conn)
             return
           }
 
@@ -186,7 +196,13 @@ final class LanTransferServer {
       fileHandle = try? FileHandle(forWritingTo: url)
     }
 
+    var lastEmit = Date.distantPast
     func emitProgress() {
+      // At most every 200 ms (plus the final one): slow links still move, fast ones
+      // don't flood the bridge.
+      let now = Date()
+      guard receivedPlain >= totalPlain || now.timeIntervalSince(lastEmit) >= 0.2 else { return }
+      lastEmit = now
       let pct = (totalPlain == 0) ? 100.0 : (Double(receivedPlain) * 100.0 / Double(totalPlain))
       onProgress?([
         "role": "server",
@@ -199,7 +215,12 @@ final class LanTransferServer {
 
     func finish() {
       try? fileHandle?.close()
-      defer { conn.cancel() }   // done with this connection (acks used to linger until stopServer)
+      // Delivery ACK, then wait for the next payload on the same connection. An
+      // older sender never reads the byte and closes — that is a normal EOF.
+      defer {
+        conn.send(content: Data([LanTransferProtocol.ack]), completion: .contentProcessed { _ in })
+        readDataHeader(conn, afterPayload: true)
+      }
       let encodingStr = (header.encoding == LanTransferProtocol.encodingUtf8) ? "utf8" : "binary"
       let digest = hasher.finalize()
       let hex = digest.map { String(format: "%02x", $0) }.joined()
@@ -249,7 +270,7 @@ final class LanTransferServer {
     // Encrypted mode
     guard let cfg = crypto, cfg.enabled, !cfg.passphrase.isEmpty else {
       onError?(["role":"server","message":"Encrypted payload received but passphrase not set.","code":"NO_PASSPHRASE"])
-      conn.cancel()
+      nakAndClose(conn)
       return
     }
 
@@ -306,7 +327,7 @@ final class LanTransferServer {
       loop()
     } catch {
       onError?(["role":"server","message":"Key derivation failed: \(error)","code":"KDF_FAILED"])
-      conn.cancel()
+      nakAndClose(conn)
     }
   }
 
@@ -352,7 +373,13 @@ final class LanTransferServer {
 
   private func fail(_ message: String, _ conn: NWConnection) {
     onError?(["role":"server","message":message,"code":"SERVER_ERROR"])
-    conn.cancel()
+    nakAndClose(conn)
+  }
+
+  /// Tell the sender this payload failed (instead of a bare close it could take for
+  /// an older receiver's normal end), then close.
+  private func nakAndClose(_ conn: NWConnection) {
+    conn.send(content: Data([LanTransferProtocol.nak]), completion: .contentProcessed { _ in conn.cancel() })
   }
 }
 

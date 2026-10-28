@@ -24,8 +24,14 @@ class LanTransferClient(
   private val stallTimer = Executors.newSingleThreadScheduledExecutor()
   /** A send with no bytes written for this long is aborted (see sendStream). */
   internal var writeStallMs = 30_000L
+  /** How long a sent payload may wait for the receiver's ACK. */
+  internal var ackTimeoutMs = 30_000
   private var socket: Socket? = null
   private val connected = AtomicBoolean(false)
+  /** host:port|key of the open socket, and whether its receiver ACKs payloads — then
+   *  the socket carries the next payload too (no new handshake per file). */
+  private var target: String? = null
+  private var reusable = false
 
   @Volatile private var crypto: LanTransferCrypto.CryptoConfig? = null
   fun setCrypto(config: LanTransferCrypto.CryptoConfig?) { crypto = config }
@@ -48,6 +54,18 @@ class LanTransferClient(
    * SO_KEEPALIVE, and retries twice (300 ms apart) before throwing.
    */
   fun connect(host: String, port: Int, sessionKey: String?, timeoutMs: Int = 7000) {
+    val key = "$host:$port|${sessionKey ?: ""}"
+    val open = socket
+    if (open != null && connected.get() && reusable && target == key && peerOpen(open)) {
+      plugin.emit("status", JSObject().apply {
+        put("role", "client")
+        put("status", "client_connected")
+        put("remoteHost", host)
+        put("remotePort", port)
+        put("reused", true)
+      })
+      return
+    }
     disconnect() // close any stale socket before reconnecting
 
     var lastErr: Exception? = null
@@ -67,6 +85,8 @@ class LanTransferClient(
         out.flush()
 
         socket = s
+        target = key
+        reusable = false
         connected.set(true)
         plugin.emit("status", JSObject().apply {
           put("role", "client")
@@ -100,6 +120,8 @@ class LanTransferClient(
     connected.set(false)
     try { socket?.close() } catch (_: Exception) {}
     socket = null
+    target = null
+    reusable = false
     plugin.emit("status", JSObject().apply {
       put("role", "client")
       put("status", "client_disconnected")
@@ -173,7 +195,7 @@ class LanTransferClient(
             // 256 KB buffer (was 64 KB) → fewer loop iterations / syscalls.
             val buffer = ByteArray(256 * 1024)
             var plainSent = 0L
-            var lastEmit = 0L
+            var lastEmitAt = 0L
             while (plainSent < totalPlain) {
               val remaining = totalPlain - plainSent
               val toRead = if (remaining < buffer.size) remaining.toInt() else buffer.size
@@ -185,14 +207,17 @@ class LanTransferClient(
               lastWrite.set(System.currentTimeMillis())
 
               plainSent += read.toLong()
-              // Throttle progress: emit at most every ~1 MB (or at the end).
-              // Per-64KB emits flood the Capacitor bridge and slow the transfer.
-              if (plainSent - lastEmit >= 1_048_576L || plainSent >= totalPlain) {
-                emitProgress(plainSent, totalPlain); lastEmit = plainSent
+              // Throttle progress by time: several updates a second on a slow link,
+              // no bridge flood on a fast one.
+              val now = System.currentTimeMillis()
+              if (now - lastEmitAt >= LanTransferServer.PROGRESS_INTERVAL_MS || plainSent >= totalPlain) {
+                emitProgress(plainSent, totalPlain); lastEmitAt = now
               }
             }
 
             out.flush()
+            watchdog?.cancel(false)
+            awaitDelivery(s)
             emitSendComplete(totalPlain, encodingStr, false, HashUtils.toHex(digest.digest()))
             done(null)
             return@use
@@ -204,6 +229,7 @@ class LanTransferClient(
           val buffer = ByteArray(chunkSize)
           var counter = 0
           var plainSent = 0L
+          var lastEmitAt = 0L
 
           while (plainSent < totalPlain) {
             val remaining = totalPlain - plainSent
@@ -220,14 +246,21 @@ class LanTransferClient(
 
             plainSent += read.toLong()
             counter += 1
-            emitProgress(plainSent, totalPlain)
+            val now = System.currentTimeMillis()
+            if (now - lastEmitAt >= LanTransferServer.PROGRESS_INTERVAL_MS || plainSent >= totalPlain) {
+              emitProgress(plainSent, totalPlain); lastEmitAt = now
+            }
           }
 
           out.flush()
+          watchdog?.cancel(false)
+          awaitDelivery(s)
           emitSendComplete(totalPlain, encodingStr, true, HashUtils.toHex(digest.digest()))
           done(null)
         }
       } catch (t: Throwable) { // incl. OutOfMemoryError on a huge video: fail the send, don't crash
+        // The stream may be cut mid-frame: never reuse this socket for the next payload.
+        if (socket != null) disconnect()
         plugin.emit("error", JSObject().apply {
           put("role", "client")
           put("code", "SEND_FAILED")
@@ -238,6 +271,43 @@ class LanTransferClient(
         watchdog?.cancel(false)
       }
     }
+  }
+
+  /** Blocks until the receiver answers the payload just written, so a resolved send
+   *  means delivered (it used to mean "in the local socket buffer", and closing the
+   *  socket for the next payload could still cut the last megabyte off).
+   *  ACK → keep the socket for the next payload. NAK → the receiver rejected it.
+   *  EOF on a socket that never ACKed → an older receiver that closes after every
+   *  payload once it has read it all: delivered, and the next connect() reconnects. */
+  private fun awaitDelivery(s: Socket) {
+    s.soTimeout = ackTimeoutMs
+    val reply = try { s.getInputStream().read() } catch (e: java.net.SocketTimeoutException) {
+      throw IOException("No delivery confirmation from the receiver within ${ackTimeoutMs / 1000} s")
+    }
+    when (reply) {
+      LanTransferProtocol.ACK.toInt() -> { reusable = true; s.soTimeout = 0 }
+      LanTransferProtocol.NAK.toInt() -> { disconnect(); throw IOException("Receiver rejected the payload") }
+      -1 -> {
+        val acked = reusable
+        disconnect()
+        if (acked) throw IOException("Receiver closed the connection before confirming")
+      }
+      else -> { disconnect(); throw IOException("Unexpected reply from receiver: $reply") }
+    }
+  }
+
+  /** A 1 ms read times out on a live idle socket and returns -1 once the peer has
+   *  closed it (e.g. the receiver's 60 s idle timeout). Nothing else may arrive
+   *  between payloads, so data also means "don't reuse". */
+  private fun peerOpen(s: Socket): Boolean {
+    if (s.isClosed) return false
+    return try {
+      s.soTimeout = 1
+      s.getInputStream().read()
+      false
+    } catch (_: java.net.SocketTimeoutException) { true }
+    catch (_: Exception) { false }
+    finally { try { s.soTimeout = 0 } catch (_: Exception) {} }
   }
 
   private fun emitProgress(bytes: Long, total: Long) {

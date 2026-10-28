@@ -11,6 +11,12 @@ enum LanTransferProtocol {
 
   static let flagEncrypted: UInt8 = 0x01
 
+  /// Receiver → sender after each payload: ack = received + receiveComplete emitted
+  /// (the connection stays open for the next frame); nak = rejected/failed. An
+  /// older receiver sends neither and closes after one payload.
+  static let ack: UInt8 = 0x06
+  static let nak: UInt8 = 0x15
+
   struct DataHeaderV2 {
     let encoding: UInt8
     let flags: UInt8

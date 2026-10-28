@@ -137,6 +137,7 @@ export interface LanTransferPlugin {
     }): Promise<ServerInfo>;
     stopServer(): Promise<void>;
     getServerInfo(): Promise<ServerInfo>;
+    /** Reuses the open connection when it is to the same host/port and still alive. */
     connect(options: {
         host: string;
         port: number;
@@ -146,6 +147,7 @@ export interface LanTransferPlugin {
     disconnect(): Promise<void>;
     getConnectionInfo(): Promise<ConnectionInfo>;
     setReceiveMode(options: SetReceiveModeOptions): Promise<void>;
+    /** Sends resolve once the receiver has confirmed the payload (see README "Delivery"). */
     sendString(options: SendStringOptions): Promise<void>;
     sendBase64(options: SendBase64Options): Promise<void>;
     sendFile(options: SendFileOptions): Promise<void>;

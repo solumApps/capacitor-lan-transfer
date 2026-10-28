@@ -4,8 +4,10 @@ import CryptoKit
 
 /// Client side of the transfer. Every call (connect, send, disconnect) runs in
 /// order on `queue`, one at a time, and reports back only when it is really done:
-/// connect when the connection is ready and the HELLO is out, a send when every
-/// byte has been handed to the network stack, disconnect after the sends before it.
+/// connect when the connection is ready and the HELLO is out, a send when the
+/// receiver has confirmed the payload (ACK byte), disconnect after the sends before
+/// it. A receiver that ACKs keeps the connection for the next payload, so connect()
+/// to the same host reuses it instead of a new handshake per file.
 ///
 /// It used to resolve connect before the connection was ready (a send arriving
 /// first was silently dropped), report send_complete as soon as the chunks were
@@ -23,6 +25,17 @@ final class LanTransferClient {
   var connectTimeout: TimeInterval = 7
   /// A send that makes no progress for this long fails (peer lost power/Wi-Fi).
   var writeStallTimeout: TimeInterval = 30
+  /// How long a sent payload may wait for the receiver's ACK.
+  var ackTimeout: TimeInterval = 30
+
+  /// host:port|key of the open connection, and whether its receiver ACKs payloads.
+  private var target: String?
+  private var reusable = false
+  /// One receive is kept outstanding on the connection; its result (a reply byte, or
+  /// nil for EOF) goes to the send waiting for it, or is parked until one asks — so
+  /// a receiver that closed an idle connection is noticed before it is reused.
+  private var replyWaiter: ((Result<UInt8?, Error>) -> Void)?
+  private var parkedReply: Result<UInt8?, Error>?
 
   var onStatus: (([String: Any]) -> Void)?
   var onProgress: (([String: Any]) -> Void)?
@@ -56,6 +69,11 @@ final class LanTransferClient {
 
   func connect(host: String, port: Int, sessionKey: String?, completion: @escaping (Error?) -> Void) {
     enqueue { next in
+      let key = "\(host):\(port)|\(sessionKey ?? "")"
+      if let open = self.conn, self.connected, self.reusable, self.target == key, self.parkedReply == nil, open.state == .ready {
+        self.onStatus?(["role": "client", "status": "client_connected", "remoteHost": host, "remotePort": port, "reused": true])
+        completion(nil); next(); return
+      }
       self.closeCurrent()
       guard let p = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
         completion(Self.error("Invalid port \(port)")); next(); return
@@ -91,6 +109,12 @@ final class LanTransferClient {
           self.connected = true
           self.onStatus?(["role": "client", "status": "client_connected", "remoteHost": host, "remotePort": port])
           c.send(content: LanTransferProtocol.helloFrame(sessionKey: sessionKey), completion: .contentProcessed { err in
+            if err == nil, self.conn === c {
+              self.target = key
+              self.reusable = false
+              self.parkedReply = nil
+              self.armReply(c)
+            }
             finish(err)
           })
         case .waiting(let err):
@@ -118,6 +142,10 @@ final class LanTransferClient {
   }
 
   private func closeCurrent() {
+    target = nil
+    reusable = false
+    replyWaiter = nil
+    parkedReply = nil
     guard let c = conn else { return }
     conn = nil
     connected = false
@@ -125,7 +153,37 @@ final class LanTransferClient {
     onStatus?(["role": "client", "status": "client_disconnected"])
   }
 
-  // MARK: - Sends (completion fires once every byte is handed to the stack)
+  private func armReply(_ c: NWConnection) {
+    c.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] data, _, isComplete, error in
+      guard let self = self, self.conn === c else { return }
+      let r: Result<UInt8?, Error>
+      if let error = error { r = .failure(error) }
+      else if let b = data?.first { r = .success(b) }
+      else if isComplete { r = .success(nil) }
+      else { self.armReply(c); return }
+      if let w = self.replyWaiter { self.replyWaiter = nil; w(r) } else { self.parkedReply = r }
+    }
+  }
+
+  private func awaitReply(_ done: @escaping (Result<UInt8?, Error>) -> Void) {
+    if let r = parkedReply { parkedReply = nil; done(r); return }
+    var settled = false
+    let timer = DispatchWorkItem { [weak self] in
+      guard !settled else { return }
+      settled = true
+      self?.replyWaiter = nil
+      done(.failure(Self.error("No delivery confirmation from the receiver within \(Int(self?.ackTimeout ?? 30)) s")))
+    }
+    replyWaiter = { r in
+      guard !settled else { return }
+      settled = true
+      timer.cancel()
+      done(r)
+    }
+    queue.asyncAfter(deadline: .now() + ackTimeout, execute: timer)
+  }
+
+  // MARK: - Sends (completion fires once the receiver confirms the payload)
 
   func sendString(_ text: String, completion: @escaping (Error?) -> Void) {
     sendPayload(encoding: LanTransferProtocol.encodingUtf8, completion: completion) {
@@ -181,6 +239,7 @@ final class LanTransferClient {
         done = true
         stall?.cancel()
         if let err = err {
+          self.closeCurrent()   // the stream may be cut mid-frame: never reuse it
           self.onError?(["role": "client", "message": "Send failed: \(err.localizedDescription)", "code": "SEND_FAILED"])
         }
         completion(err)
@@ -222,7 +281,7 @@ final class LanTransferClient {
 
       var hasher = SHA256()
       var sent: Int64 = 0
-      var lastEmit: Int64 = 0
+      var lastEmit = Date.distantPast
       var counter = 0
 
       // One chunk in flight at a time: each send waits for the previous one's
@@ -230,10 +289,31 @@ final class LanTransferClient {
       func sendNext() {
         guard !done else { return }
         guard let plain = source.next(chunkSize) else {
-          let hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-          self.onStatus?(["role": "client", "status": "send_complete", "totalBytes": Int(source.total),
-                          "encoding": encodingStr, "encrypted": encrypted, "sha256": hex])
-          finish(nil)
+          // Everything is written: the send is done when the receiver answers.
+          stall?.cancel()
+          self.awaitReply { r in
+            switch r {
+            case .success(.some(LanTransferProtocol.ack)):
+              self.reusable = true
+              self.armReply(c)
+            case .success(.some(LanTransferProtocol.nak)):
+              finish(Self.error("Receiver rejected the payload")); return
+            case .success(.none):
+              // EOF: an older receiver closes after each payload once it has read it
+              // all — delivered. After an ACK on this connection, EOF is a failure.
+              let acked = self.reusable
+              self.closeCurrent()
+              if acked { finish(Self.error("Receiver closed the connection before confirming")); return }
+            case .success(.some(let b)):
+              finish(Self.error("Unexpected reply from receiver: \(b)")); return
+            case .failure(let e):
+              finish(e); return
+            }
+            let hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            self.onStatus?(["role": "client", "status": "send_complete", "totalBytes": Int(source.total),
+                            "encoding": encodingStr, "encrypted": encrypted, "sha256": hex])
+            finish(nil)
+          }
           return
         }
         hasher.update(data: plain)
@@ -255,8 +335,9 @@ final class LanTransferClient {
           if let err = err { finish(err); return }
           sent += Int64(plain.count)
           armStall(c)
-          if sent - lastEmit >= 1_048_576 || sent >= source.total {
-            lastEmit = sent
+          let now = Date()
+          if now.timeIntervalSince(lastEmit) >= 0.2 || sent >= source.total {
+            lastEmit = now
             let pct = source.total == 0 ? 100.0 : Double(sent) * 100.0 / Double(source.total)
             self.onProgress?(["role": "client", "direction": "send", "bytesTransferred": Int(sent),
                               "totalBytes": Int(source.total), "percent": pct])

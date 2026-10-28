@@ -170,7 +170,22 @@ Possible values:
 - `connection_accepted`, `connection_closed`
 - `receive_started` (server received header; includes `totalBytes`, `encoding`, `encrypted`)
 - `send_started` (client started sending; includes `totalBytes`, `encoding`, `encrypted`)
-- `send_complete` (client finished sending; includes `sha256`)
+- `send_complete` (the receiver confirmed the payload; includes `sha256`)
+
+### Delivery and connection reuse
+
+After each payload the receiver writes one byte: `0x06` (ACK — written and
+`receiveComplete` emitted) or `0x15` (NAK — rejected/failed). `sendString` /
+`sendBase64` / `sendFile` resolve on the ACK, so a resolved send means
+*delivered*, not just buffered. The connection then stays open: calling
+`connect()` again with the same host/port reuses it (no new TCP handshake per
+payload), which is what makes many small files fast on a weak Wi-Fi link. An idle
+connection is closed by the receiver after 60 s and reopened by the next
+`connect()`. Call `disconnect()` when done.
+
+Older receivers send no reply and close after one payload: the client treats that
+close as delivered and reconnects for the next payload, so mixed versions work.
+Progress events are throttled by time (about 5 per second plus the final one).
 
 ### progress
 
