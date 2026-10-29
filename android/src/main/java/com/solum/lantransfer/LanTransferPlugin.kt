@@ -21,7 +21,12 @@ import com.getcapacitor.annotation.PermissionCallback
 class LanTransferPlugin : Plugin() {
 
   private var server: LanTransferServer? = null
-  private var client: LanTransferClient? = null
+  /** One client (socket + worker thread) per host:port, so sends to different
+   *  displays run in parallel. Calls that name no host use the last connect()'s.
+   *  ponytail: clients live for the app's lifetime (2 idle threads per display
+   *  address ever used); evict on disconnect if stores ever reach dozens. */
+  private val clients = java.util.concurrent.ConcurrentHashMap<String, LanTransferClient>()
+  @Volatile private var current: LanTransferClient? = null
   private var discovery: LanTransferDiscovery? = null
 
 
@@ -248,10 +253,10 @@ class LanTransferPlugin : Plugin() {
       return
     }
 
-    ensureClient()
-    client?.setCrypto(cryptoCfg)
+    val c = clientFor(host, port)
+    c.setCrypto(cryptoCfg)
     try {
-      client?.connect(host, port, sessionKey)  // blocking; throws on failure
+      c.connect(host, port, sessionKey)  // blocking; throws on failure
     } catch (e: Exception) {
       call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
       return
@@ -312,8 +317,7 @@ class LanTransferPlugin : Plugin() {
       return
     }
 
-    ensureClient()
-    val c = client!!
+    val c = clientFor(host, port)
     c.setCrypto(cryptoCfg)
     c.enqueue({ c.connect(host, port, sessionKey) }) { e ->
       if (e != null) call.reject(e.message ?: "CONNECT_FAILED", "CONNECT_FAILED")
@@ -328,15 +332,18 @@ class LanTransferPlugin : Plugin() {
 
   @PluginMethod
   fun disconnect(call: PluginCall) {
-    val c = client ?: return call.resolve()
-    // Queued behind pending sends, so it can't cut one off mid-write.
-    c.enqueue({ c.disconnect() }) { call.resolve() }
+    // One connection when a host is named, otherwise all of them. Queued behind
+    // pending sends, so it can't cut one off mid-write.
+    val targets = if (call.getString("host").isNullOrBlank()) clients.values.toList() else listOfNotNull(targetOf(call))
+    if (targets.isEmpty()) return call.resolve()
+    val left = java.util.concurrent.atomic.AtomicInteger(targets.size)
+    for (c in targets) c.enqueue({ c.disconnect() }) { if (left.decrementAndGet() == 0) call.resolve() }
   }
 
   @PluginMethod
   fun getConnectionInfo(call: PluginCall) {
     call.resolve(JSObject().apply {
-      put("connected", client?.isConnected() == true)
+      put("connected", current?.isConnected() == true)
       put("role", "client")
     })
   }
@@ -351,27 +358,27 @@ class LanTransferPlugin : Plugin() {
   @PluginMethod
   fun sendString(call: PluginCall) {
     val text = call.getString("text") ?: return call.reject("text is required")
-    ensureClient()
+    val c = targetOf(call) ?: return call.reject("Not connected", "NOT_CONNECTED")
     try {
-      client!!.sendString(text) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+      c.sendString(text) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
     } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
   @PluginMethod
   fun sendBase64(call: PluginCall) {
     val base64 = call.getString("base64") ?: return call.reject("base64 is required")
-    ensureClient()
+    val c = targetOf(call) ?: return call.reject("Not connected", "NOT_CONNECTED")
     try {
-      client!!.sendBase64(base64) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+      c.sendBase64(base64) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
     } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
   @PluginMethod
   fun sendFile(call: PluginCall) {
     val path = call.getString("path") ?: return call.reject("path is required")
-    ensureClient()
+    val c = targetOf(call) ?: return call.reject("Not connected", "NOT_CONNECTED")
     try {
-      client!!.sendFile(path) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
+      c.sendFile(path) { e -> if (e != null) call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") else call.resolve() }
     } catch (e: Exception) { call.reject(e.message ?: "SEND_FAILED", "SEND_FAILED") }
   }
 
@@ -380,7 +387,7 @@ class LanTransferPlugin : Plugin() {
    *  could not bind, so payloads went to a server whose bridge was dead. */
   override fun handleOnDestroy() {
     try { server?.stop() } catch (_: Exception) {}
-    try { client?.disconnect() } catch (_: Exception) {}
+    for (c in clients.values) try { c.disconnect() } catch (_: Exception) {}
     try { discovery?.stopAdvertise(); discovery?.stopDiscovery() } catch (_: Exception) {}
     super.handleOnDestroy()
   }
@@ -393,7 +400,12 @@ class LanTransferPlugin : Plugin() {
     }
   }
 
-  private fun ensureClient() {
-    if (client == null) client = LanTransferClient(context, this)
+  private fun clientFor(host: String, port: Int): LanTransferClient =
+    clients.getOrPut("$host:$port") { LanTransferClient(context, this) }.also { current = it }
+
+  /** The connection a send/disconnect names (host + port), else the last connect()'s. */
+  private fun targetOf(call: PluginCall): LanTransferClient? {
+    val host = call.getString("host"); val port = call.getInt("port")
+    return if (host.isNullOrBlank() || port == null) current else clients["$host:$port"]
   }
 }

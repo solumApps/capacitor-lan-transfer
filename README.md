@@ -147,9 +147,9 @@ needed on either side.
 
 ### Sending
 
-- `sendString({ text })`
-- `sendBase64({ base64 })`
-- `sendFile({ path })`
+- `sendString({ text, host?, port? })`
+- `sendBase64({ base64, host?, port? })`
+- `sendFile({ path, host?, port? })`
 
 `sendFile({ path })` accepts:
 
@@ -186,6 +186,22 @@ connection is closed by the receiver after 60 s and reopened by the next
 Older receivers send no reply and close after one payload: the client treats that
 close as delivered and reconnects for the next payload, so mixed versions work.
 Progress events are throttled by time (about 5 per second plus the final one).
+
+### Several receivers at once
+
+Every `host:port` gets its own connection and worker, so sends to different
+receivers run in parallel (deploying to 3 displays takes about as long as 1).
+Name the receiver on each send — `sendString({ text, host, port })`,
+`sendBase64({ base64, host, port })`, `sendFile({ path, host, port })` — after a
+`connect({ host, port })` to it. A send without `host` uses the most recent
+`connect()` (single-receiver code keeps working); one that names a receiver
+nobody connected to rejects with `NOT_CONNECTED`. Client `progress`, `status`
+and `error` events carry `remoteHost` / `remotePort`. `disconnect({ host, port })`
+closes one connection, `disconnect()` all of them.
+
+For a big file going to several receivers, write it to disk once and `sendFile`
+it to each: `sendBase64` would carry a full copy through the native bridge (and
+decode it) for every receiver.
 
 ### progress
 

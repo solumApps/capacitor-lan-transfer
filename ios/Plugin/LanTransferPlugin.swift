@@ -4,7 +4,11 @@ import Capacitor
 @objc(LanTransferPlugin)
 public class LanTransferPlugin: CAPPlugin {
   private let server = LanTransferServer()
-  private let client = LanTransferClient()
+  /// One client (connection + serial queue) per host:port, so sends to different
+  /// displays run in parallel. Calls that name no host use the last connect()'s.
+  private var clients: [String: LanTransferClient] = [:]
+  private var current: LanTransferClient?
+  private let clientsLock = NSLock()
   private let discovery = LanTransferDiscovery()
 
   public override func load() {
@@ -12,10 +16,6 @@ public class LanTransferPlugin: CAPPlugin {
     server.onProgress = { [weak self] obj in self?.notifyListeners("progress", data: obj) }
     server.onReceiveComplete = { [weak self] obj in self?.notifyListeners("receiveComplete", data: obj) }
     server.onError = { [weak self] obj in self?.notifyListeners("error", data: obj) }
-
-    client.onStatus = { [weak self] obj in self?.notifyListeners("status", data: obj) }
-    client.onProgress = { [weak self] obj in self?.notifyListeners("progress", data: obj) }
-    client.onError = { [weak self] obj in self?.notifyListeners("error", data: obj) }
 
     discovery.onEvent = { [weak self] event, data in
       self?.notifyListeners(event, data: data)
@@ -82,7 +82,7 @@ public class LanTransferPlugin: CAPPlugin {
         if inet_pton(AF_INET, host, &addr.sin_addr) == 1 {
           let res = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-              connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+              Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) // the POSIX call, not this plugin's connect(_:)
             }
           }
           ok = (res == 0)
@@ -141,15 +141,17 @@ public class LanTransferPlugin: CAPPlugin {
       return
     }
 
-    client.crypto = cryptoCfg
-    client.connect(host: host, port: serverPort, sessionKey: sessionKey)
-
-    call.resolve([
-      "connected": true,
-      "role": "client",
-      "remoteHost": host,
-      "remotePort": serverPort
-    ])
+    let c = client(host: host, port: serverPort)
+    c.crypto = cryptoCfg
+    c.connect(host: host, port: serverPort, sessionKey: sessionKey) { err in
+      if let err = err { call.reject("Connect failed: \(err.localizedDescription)", "CONNECT_FAILED"); return }
+      call.resolve([
+        "connected": true,
+        "role": "client",
+        "remoteHost": host,
+        "remotePort": serverPort
+      ])
+    }
   }
 
   @objc func startServer(_ call: CAPPluginCall) {
@@ -183,24 +185,62 @@ public class LanTransferPlugin: CAPPlugin {
       call.reject("host and port are required")
       return
     }
-    client.crypto = parseCrypto(call)
+    let c = client(host: host, port: port)
+    c.crypto = parseCrypto(call)
     // Resolves only once the connection is ready (was: immediately, so a send
     // that arrived first was silently dropped); rejects on refusal/timeout.
-    client.connect(host: host, port: port, sessionKey: call.getString("sessionKey")) { err in
+    c.connect(host: host, port: port, sessionKey: call.getString("sessionKey")) { err in
       if let err = err { call.reject("Connect failed: \(err.localizedDescription)", "CONNECT_FAILED") }
       else { call.resolve(["connected": true, "role": "client", "remoteHost": host, "remotePort": port]) }
     }
   }
 
-  @objc func disconnect(_ call: CAPPluginCall) { client.disconnect { call.resolve() } }
+  /// Closes the named connection, or every one when no host is given.
+  @objc func disconnect(_ call: CAPPluginCall) {
+    clientsLock.lock()
+    let targets = call.getString("host") == nil ? Array(clients.values) : [target(of: call)].compactMap { $0 }
+    clientsLock.unlock()
+    let group = DispatchGroup()
+    for c in targets { group.enter(); c.disconnect { group.leave() } }
+    group.notify(queue: .global()) { call.resolve() }
+  }
 
   @objc func getConnectionInfo(_ call: CAPPluginCall) {
+    clientsLock.lock(); let c = current; clientsLock.unlock()
     call.resolve([
-      "connected": client.connected,
+      "connected": c?.connected ?? false,
       "role": "client",
-      "remoteHost": client.remoteHost as Any,
-      "remotePort": client.remotePort as Any
+      "remoteHost": c?.remoteHost as Any,
+      "remotePort": c?.remotePort as Any
     ])
+  }
+
+  /// The client for host:port (created on first use, with events that name it).
+  private func client(host: String, port: Int) -> LanTransferClient {
+    clientsLock.lock(); defer { clientsLock.unlock() }
+    let key = "\(host):\(port)"
+    if let c = clients[key] { current = c; return c }
+    let c = LanTransferClient()
+    let tag: ([String: Any]) -> [String: Any] = { var o = $0; o["remoteHost"] = host; o["remotePort"] = port; return o }
+    c.onStatus = { [weak self] obj in self?.notifyListeners("status", data: tag(obj)) }
+    c.onProgress = { [weak self] obj in self?.notifyListeners("progress", data: tag(obj)) }
+    c.onError = { [weak self] obj in self?.notifyListeners("error", data: tag(obj)) }
+    clients[key] = c
+    current = c
+    return c
+  }
+
+  /// The connection a send/disconnect names (host + port), else the last connect()'s.
+  /// Callers hold `clientsLock`.
+  private func target(of call: CAPPluginCall) -> LanTransferClient? {
+    if let host = call.getString("host"), let port = call.getInt("port") { return clients["\(host):\(port)"] }
+    return current
+  }
+
+  private func sendTarget(_ call: CAPPluginCall) -> LanTransferClient? {
+    clientsLock.lock(); defer { clientsLock.unlock() }
+    guard let c = target(of: call) else { call.reject("Not connected", "NOT_CONNECTED"); return nil }
+    return c
   }
 
   @objc func setReceiveMode(_ call: CAPPluginCall) {
@@ -211,21 +251,24 @@ public class LanTransferPlugin: CAPPlugin {
 
   @objc func sendString(_ call: CAPPluginCall) {
     guard let text = call.getString("text") else { call.reject("text is required"); return }
-    client.sendString(text) { err in
+    guard let c = sendTarget(call) else { return }
+    c.sendString(text) { err in
       if let err = err { call.reject("sendString failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
     }
   }
 
   @objc func sendBase64(_ call: CAPPluginCall) {
     guard let base64 = call.getString("base64") else { call.reject("base64 is required"); return }
-    client.sendBase64(base64) { err in
+    guard let c = sendTarget(call) else { return }
+    c.sendBase64(base64) { err in
       if let err = err { call.reject("sendBase64 failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
     }
   }
 
   @objc func sendFile(_ call: CAPPluginCall) {
     guard let path = call.getString("path") else { call.reject("path is required"); return }
-    client.sendFile(path: path) { err in
+    guard let c = sendTarget(call) else { return }
+    c.sendFile(path: path) { err in
       if let err = err { call.reject("sendFile failed: \(err.localizedDescription)", "SEND_FAILED") } else { call.resolve() }
     }
   }

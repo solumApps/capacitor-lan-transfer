@@ -29,13 +29,22 @@ export interface ConnectionInfo {
     remoteHost?: string;
     remotePort?: number;
 }
-export interface SendStringOptions {
+/**
+ * Which connection a send or disconnect uses. Every host:port has its own
+ * connection and worker, so sends to different receivers run in parallel.
+ * Omitted: the connection of the most recent connect() (single-target callers).
+ */
+export interface ConnectionTarget {
+    host?: string;
+    port?: number;
+}
+export interface SendStringOptions extends ConnectionTarget {
     text: string;
 }
-export interface SendBase64Options {
+export interface SendBase64Options extends ConnectionTarget {
     base64: string;
 }
-export interface SendFileOptions {
+export interface SendFileOptions extends ConnectionTarget {
     /**
      * Absolute filesystem path OR a URI:
      * - file://... (Capacitor Filesystem typically returns this)
@@ -53,6 +62,9 @@ export interface ProgressEvent {
     bytesTransferred: number;
     totalBytes: number;
     percent: number;
+    /** Client sends: the connection this is about (tell parallel sends apart). */
+    remoteHost?: string;
+    remotePort?: number;
 }
 export interface ReceiveCompleteEvent {
     role: Role;
@@ -137,14 +149,16 @@ export interface LanTransferPlugin {
     }): Promise<ServerInfo>;
     stopServer(): Promise<void>;
     getServerInfo(): Promise<ServerInfo>;
-    /** Reuses the open connection when it is to the same host/port and still alive. */
+    /** Reuses the open connection when it is to the same host/port and still alive.
+     *  Connections to different host/ports are independent and can send in parallel. */
     connect(options: {
         host: string;
         port: number;
         sessionKey?: string;
         encryption?: EncryptionOptions;
     }): Promise<ConnectionInfo>;
-    disconnect(): Promise<void>;
+    /** Closes that connection; with no target, every client connection. */
+    disconnect(options?: ConnectionTarget): Promise<void>;
     getConnectionInfo(): Promise<ConnectionInfo>;
     setReceiveMode(options: SetReceiveModeOptions): Promise<void>;
     /** Sends resolve once the receiver has confirmed the payload (see README "Delivery"). */

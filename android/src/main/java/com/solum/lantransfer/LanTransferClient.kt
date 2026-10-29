@@ -38,6 +38,14 @@ class LanTransferClient(
 
   fun isConnected(): Boolean = connected.get()
 
+  /** host/port of the last connect(): every event names its connection, so a caller
+   *  sending to several displays at once can tell their progress apart. */
+  @Volatile private var remote: Pair<String, Int>? = null
+  private fun emit(event: String, data: JSObject) {
+    remote?.let { (h, p) -> data.put("remoteHost", h); data.put("remotePort", p) }
+    plugin.emit(event, data)
+  }
+
   /** Run [work] on the client thread, after any queued connect/send, and report
    *  the outcome. Keeps connect() off Capacitor's plugin thread — it is shared by
    *  every plugin, and a 2 x 7 s connect timeout there froze all Filesystem calls. */
@@ -55,9 +63,10 @@ class LanTransferClient(
    */
   fun connect(host: String, port: Int, sessionKey: String?, timeoutMs: Int = 7000) {
     val key = "$host:$port|${sessionKey ?: ""}"
+    remote = host to port
     val open = socket
     if (open != null && connected.get() && reusable && target == key && peerOpen(open)) {
-      plugin.emit("status", JSObject().apply {
+      emit("status", JSObject().apply {
         put("role", "client")
         put("status", "client_connected")
         put("remoteHost", host)
@@ -88,7 +97,7 @@ class LanTransferClient(
         target = key
         reusable = false
         connected.set(true)
-        plugin.emit("status", JSObject().apply {
+        emit("status", JSObject().apply {
           put("role", "client")
           put("status", "client_connected")
           put("remoteHost", host)
@@ -107,7 +116,7 @@ class LanTransferClient(
       }
     }
 
-    plugin.emit("error", JSObject().apply {
+    emit("error", JSObject().apply {
       put("role", "client")
       put("code", "CONNECT_FAILED")
       put("message", lastErr?.message ?: "connect failed")
@@ -122,7 +131,7 @@ class LanTransferClient(
     socket = null
     target = null
     reusable = false
-    plugin.emit("status", JSObject().apply {
+    emit("status", JSObject().apply {
       put("role", "client")
       put("status", "client_disconnected")
     })
@@ -170,7 +179,7 @@ class LanTransferClient(
           val iters = cfg?.iterations ?: 100_000
           val encodingStr = if (encoding == LanTransferProtocol.ENCODING_UTF8) "utf8" else "binary"
 
-          plugin.emit("status", JSObject().apply {
+          emit("status", JSObject().apply {
             put("role", "client")
             put("status", "send_started")
             put("totalBytes", totalPlain)
@@ -261,7 +270,7 @@ class LanTransferClient(
       } catch (t: Throwable) { // incl. OutOfMemoryError on a huge video: fail the send, don't crash
         // The stream may be cut mid-frame: never reuse this socket for the next payload.
         if (socket != null) disconnect()
-        plugin.emit("error", JSObject().apply {
+        emit("error", JSObject().apply {
           put("role", "client")
           put("code", "SEND_FAILED")
           put("message", t.message ?: t.toString())
@@ -312,7 +321,7 @@ class LanTransferClient(
 
   private fun emitProgress(bytes: Long, total: Long) {
     val percent = if (total == 0L) 100.0 else (bytes * 100.0 / total)
-    plugin.emit("progress", JSObject().apply {
+    emit("progress", JSObject().apply {
       put("role", "client")
       put("direction", "send")
       put("bytesTransferred", bytes)
@@ -327,7 +336,7 @@ class LanTransferClient(
     encrypted: Boolean,
     sha256: String
   ) {
-    plugin.emit("status", JSObject().apply {
+    emit("status", JSObject().apply {
       put("role", "client")
       put("status", "send_complete")
       put("totalBytes", totalPlain)
