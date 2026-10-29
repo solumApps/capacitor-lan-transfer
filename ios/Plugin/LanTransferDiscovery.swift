@@ -34,10 +34,19 @@ final class LanTransferDiscovery: NSObject {
   private let stateLock = NSLock()
 
   // ---------- UDP state ----------
-  private var responderRunning = false
-  private var proberRunning = false
-  private var responderFD: Int32 = -1
-  private var proberFD: Int32 = -1
+  /// One per UDP loop run. stop() only flips it; the loop's own thread closes its
+  /// socket on the way out (within its receive timeout). stop() used to close the
+  /// fd itself, then the loop closed the same fd number again — by then reused by
+  /// WebKit or Network.framework (EXC_GUARD crash mid-deploy) — and a restart set
+  /// the shared flag back to true, so the old loop kept running on a closed fd.
+  private final class LoopRun {
+    private let lock = NSLock()
+    private var on = true
+    var running: Bool { lock.lock(); defer { lock.unlock() }; return on }
+    func stop() { lock.lock(); on = false; lock.unlock() }
+  }
+  private var responderRun: LoopRun?
+  private var proberRun: LoopRun?
 
   // MARK: - ADVERTISE (receiver side)
 
@@ -98,12 +107,13 @@ final class LanTransferDiscovery: NSObject {
 
   private func startUdpResponder() {
     stopUdpResponder()
-    responderRunning = true
+    let run = LoopRun()
+    responderRun = run
     DispatchQueue.global(qos: .utility).async { [weak self] in
       guard let self = self else { return }
       let fd = socket(AF_INET, SOCK_DGRAM, 0)
       guard fd >= 0 else { return }
-      self.responderFD = fd
+      defer { close(fd) }
       var on: Int32 = 1
       setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
       setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, socklen_t(MemoryLayout<Int32>.size))
@@ -118,13 +128,12 @@ final class LanTransferDiscovery: NSObject {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
       }
       if bindRes != 0 {
-        close(fd); self.responderFD = -1
         self.onEvent?("error", ["role": "server", "code": "UDP_RESPONDER_FAILED", "message": "UDP bind failed (port \(LanTransferDiscovery.udpPort))"])
         return
       }
 
       var buf = [UInt8](repeating: 0, count: 2048)
-      while self.responderRunning {
+      while run.running {
         var from = sockaddr_in()
         var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
         let n = withUnsafeMutablePointer(to: &from) {
@@ -157,26 +166,25 @@ final class LanTransferDiscovery: NSObject {
           }
         }
       }
-      close(fd)
-      self.responderFD = -1
     }
   }
 
   private func stopUdpResponder() {
-    responderRunning = false
-    if responderFD >= 0 { close(responderFD); responderFD = -1 }
+    responderRun?.stop()
+    responderRun = nil
   }
 
   // MARK: - UDP prober
 
   private func startUdpProber() {
     stopUdpProber()
-    proberRunning = true
+    let run = LoopRun()
+    proberRun = run
     DispatchQueue.global(qos: .utility).async { [weak self] in
       guard let self = self else { return }
       let fd = socket(AF_INET, SOCK_DGRAM, 0)
       guard fd >= 0 else { return }
-      self.proberFD = fd
+      defer { close(fd) }
       var on: Int32 = 1
       setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, socklen_t(MemoryLayout<Int32>.size))
       var tv = timeval(tv_sec: 0, tv_usec: 400_000)
@@ -189,7 +197,7 @@ final class LanTransferDiscovery: NSObject {
 
       func nowMs() -> Int { Int(Date().timeIntervalSince1970 * 1000) }
 
-      while self.proberRunning {
+      while run.running {
         let now = nowMs()
         if now - lastProbeAt >= LanTransferDiscovery.probeIntervalMs {
           lastProbeAt = now
@@ -243,14 +251,12 @@ final class LanTransferDiscovery: NSObject {
           self.onEvent?("deviceFound", out)
         }
       }
-      close(fd)
-      self.proberFD = -1
     }
   }
 
   private func stopUdpProber() {
-    proberRunning = false
-    if proberFD >= 0 { close(proberFD); proberFD = -1 }
+    proberRun?.stop()
+    proberRun = nil
   }
 }
 

@@ -5,6 +5,9 @@
 // Without this file the Swift methods are never exposed to JS on iOS.
 CAP_PLUGIN(LanTransferPlugin, "LanTransfer",
   CAP_PLUGIN_METHOD(initialize, CAPPluginReturnPromise);
+  CAP_PLUGIN_METHOD(isHotspotSupported, CAPPluginReturnPromise);
+  CAP_PLUGIN_METHOD(openWifiSettings, CAPPluginReturnPromise);
+  CAP_PLUGIN_METHOD(openHotspotSettings, CAPPluginReturnPromise);
   CAP_PLUGIN_METHOD(startServer, CAPPluginReturnPromise);
   CAP_PLUGIN_METHOD(stopServer, CAPPluginReturnPromise);
   CAP_PLUGIN_METHOD(getServerInfo, CAPPluginReturnPromise);

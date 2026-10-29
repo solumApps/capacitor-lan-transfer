@@ -1,5 +1,6 @@
 import Foundation
 import Capacitor
+import UIKit
 
 @objc(LanTransferPlugin)
 public class LanTransferPlugin: CAPPlugin {
@@ -55,13 +56,28 @@ public class LanTransferPlugin: CAPPlugin {
 
   @objc func getNetworkInfo(_ call: CAPPluginCall) {
     let interfaces = NetUtils.allIPv4Addresses().map { i -> [String: Any] in
-      ["name": i.name, "ip": i.ip]
+      // prefixLength like Android: callers match a display's IP to the right interface.
+      let prefix = i.netmask.split(separator: ".").compactMap { UInt8($0) }.reduce(0) { $0 + $1.nonzeroBitCount }
+      return ["name": i.name, "ip": i.ip, "prefixLength": prefix]
     }
     call.resolve([
       "ip": NetUtils.localIPv4Address(),
       "interfaces": interfaces
     ])
   }
+
+  // iOS lets an app open only its own Settings page (Wi-Fi / Personal Hotspot have
+  // no public URL), and an app cannot turn on or detect a hotspot it could join.
+  @objc func isHotspotSupported(_ call: CAPPluginCall) { call.resolve(["supported": false]) }
+
+  @objc func openWifiSettings(_ call: CAPPluginCall) {
+    DispatchQueue.main.async {
+      if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+      call.resolve()
+    }
+  }
+
+  @objc func openHotspotSettings(_ call: CAPPluginCall) { openWifiSettings(call) }
 
   @objc func checkReachable(_ call: CAPPluginCall) {
     guard let host = call.getString("host"), let port = call.getInt("port") else {
