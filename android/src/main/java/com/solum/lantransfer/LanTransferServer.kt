@@ -27,6 +27,8 @@ class LanTransferServer(
   private val running = AtomicBoolean(false)
 
   @Volatile private var sessionKey: String? = null
+  /** File mode: UTF-8 payloads up to this size are delivered inline as `text`. */
+  private val INLINE_TEXT_MAX = 256L * 1024L
   @Volatile private var receiveMode: String = "file" // "file" | "memory"
   @Volatile private var receiveFileName: String? = null
   @Volatile private var crypto: LanTransferCrypto.CryptoConfig? = null
@@ -265,8 +267,19 @@ class LanTransferServer(
                 js.put("role", "server")
                 js.put("encoding", encodingStr)
                 js.put("totalBytes", totalPlain)
-                js.put("filePath", outFile?.absolutePath ?: "")
                 js.put("sha256", sha)
+                // Small text payloads (per-media metadata, server config, most
+                // layouts) go inline: handing JS a temp-file path cost two more bridge
+                // round-trips each (read + delete), which on slow boards added up to
+                // seconds per deploy. Large text and all binary stay on disk.
+                val f = outFile
+                if (encoding == LanTransferProtocol.ENCODING_UTF8 && f != null && totalPlain <= INLINE_TEXT_MAX) {
+                  js.put("text", f.readText(Charsets.UTF_8))
+                  js.put("filePath", "")
+                  f.delete()
+                } else {
+                  js.put("filePath", f?.absolutePath ?: "")
+                }
                 emitEvent("receiveComplete", js)
       } else {
         val bytes = memSink?.toByteArray() ?: ByteArray(0)
